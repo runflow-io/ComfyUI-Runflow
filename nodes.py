@@ -509,7 +509,7 @@ class RunflowDeploy:
             info = read_git(path)
             origin = info.origin
             if path.resolve() == self_dir or path.name == "ComfyUI-Runflow":
-                origin = "https://github.com/bettergroupinc/ComfyUI-Runflow"
+                origin = "https://github.com/runflow-io/ComfyUI-Runflow"
             return path.name, {
                 "origin": origin,
                 "commit": info.commit,
