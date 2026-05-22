@@ -58,6 +58,20 @@ def _comfy_core_class_types() -> set[str]:
         return set()
 
 
+# Stock frontend/editor pseudo-nodes that have no Python class in
+# NODE_CLASS_MAPPINGS — they're rendered by the editor and rewired by the
+# executor at run time. Without this set the resolver treats them as missing
+# custom nodes and dumps them into ``unresolved``.
+_STOCK_FRONTEND_NODES: frozenset[str] = frozenset(
+    {
+        "Reroute",
+        "PrimitiveNode",
+        "Note",
+        "MarkdownNote",
+    }
+)
+
+
 # ---------------------------------------------------------------------------
 # Registry client (session-scoped, in-memory)
 # ---------------------------------------------------------------------------
@@ -574,6 +588,12 @@ async def plan_setup(graph: dict) -> dict:
         if class_type in loaded_class_types:
             continue
         if cnr_id == "comfy-core":
+            continue
+        # Stock frontend pseudo-nodes (Reroute, Note, etc.) have no Python
+        # class registered, so the loaded-class check above doesn't catch
+        # them. Treat them as already-runnable so they don't surface as
+        # unresolved custom nodes.
+        if class_type in _STOCK_FRONTEND_NODES:
             continue
 
         origin: str | None = None
