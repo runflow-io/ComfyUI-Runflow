@@ -53,6 +53,22 @@ Place a `Runflow Input (…)` node for each value your endpoint takes and a `Run
 | `Runflow Output (Image)` | Saves each image in the batch as PNG to ComfyUI's output directory. |
 | `Runflow Output (File)` | Marks a file already written under ComfyUI's `output/` directory (by an upstream save-* node) as the run's deliverable. Use for videos, 3D meshes, audio, archives, etc. Connect any node's filename/path string output to its `value` socket — subfolders relative to `output/` are supported. |
 
+### Encoder bridges (Runflow/Save category)
+
+These nodes encode ComfyUI native sockets to a file in `output/` and emit the relative filename on a STRING output socket — ready to wire into `Runflow Output (File)`.
+
+| Node | Input | Format / codec |
+|------|-------|----------------|
+| `Runflow Save Audio (FLAC)` | AUDIO | FLAC, lossless |
+| `Runflow Save Audio (MP3)` | AUDIO | MP3 / libmp3lame, with `quality` widget (`V0`, `128k`, `320k`) |
+| `Runflow Save Audio (Opus)` | AUDIO | Opus / libopus, with bitrate widget (`64k`–`320k`) |
+| `Runflow Save Video (MP4)` | VIDEO | MP4 / H.264 (delegates to `VIDEO.save_to`) |
+| `Runflow Save Video (WEBM)` | IMAGE batch + fps | WebM / VP9 or AV1 — mirrors stock ComfyUI's `SaveWEBM` input shape (the VIDEO socket's `save_to` doesn't expose a WebM container yet) |
+
+The audio nodes delegate to ComfyUI's own `AudioSaveHelper`, so encoding stays in lockstep with ComfyUI's stock `Save Audio` family. The MP4 node calls the VIDEO socket's own `save_to(...)` method. The WEBM node uses PyAV directly because the VIDEO socket only supports MP4/H.264 today.
+
+Requires a recent ComfyUI (`comfy_api.latest` module). On older installs the audio and video save nodes are skipped at plugin load with a single warning — the rest of the plugin still works.
+
 ## Auto setup
 
 The **Auto setup** button (directly below Deploy on the Runflow Deploy node) installs every custom node and downloads every model the active workflow needs. Useful when you load someone else's workflow and don't want to chase its dependencies by hand.
