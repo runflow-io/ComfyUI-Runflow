@@ -5,21 +5,23 @@ The deploy-time rewriter (future work in the inference service) consumes
 the class attrs below to inject caller-supplied values without executing
 Python here.
 
-The 1.0 surface is intentionally narrow: STRING / INT / FLOAT / BOOLEAN /
-IMAGE inputs and a single IMAGE output. Other socket types (MASK, LATENT,
-FILE, plus the Seed input variant) were removed pending end-to-end
-deploy support.
+Inputs cover STRING / INT / FLOAT / BOOLEAN / IMAGE. Outputs cover IMAGE
+(saves each batch image as PNG) and FILE (announces an arbitrary file
+already sitting under ComfyUI's output directory — videos, 3D meshes,
+audio, archives). MASK / LATENT and the Seed input variant remain off
+the surface pending end-to-end deploy support.
 
-The IMAGE output saves each image in the batch to ComfyUI's output
-directory and returns `{"ui": {"images": [...]}, "result": (value,)}`
-so each artifact lands in `/history/{prompt_id}.outputs` keyed by the
-output node's own id. The deploy worker then maps that node id to the
+Both output node kinds emit `{"ui": {...}, "result": (value,)}` so each
+artifact lands in `/history/{prompt_id}.outputs` keyed by the output
+node's own id. The deploy worker then maps that node id to the
 customer-facing `output_id` via class_type
-(`outputs.py:extract_output_id_map`).
+(`outputs.py:extract_output_id_map`) and uploads everything under a
+known artifact bucket (`images`, `gifs`, `audios`, `videos`,
+`model_files`, `files`).
 
 Contract consumed by the rewriter:
 - RUNFLOW_IO     "input" | "output"
-- RUNFLOW_TYPE   ComfyUI socket type (e.g. "IMAGE", "STRING")
+- RUNFLOW_TYPE   ComfyUI socket type (e.g. "IMAGE", "STRING", "FILE")
 
 `input_id` / `output_id` are the stable join keys. They are never
 mutated at deploy time — the rewriter rewires the `value` socket's
@@ -29,6 +31,7 @@ upstream to inject a caller-supplied value for input nodes.
 from __future__ import annotations
 
 import os
+from pathlib import Path, PurePosixPath
 
 import folder_paths
 import numpy as np
@@ -111,12 +114,74 @@ class RunflowOutputImage:
         return {"ui": {"images": results}, "result": (value,)}
 
 
+class RunflowOutputFile:
+    """Runflow named output (FILE). Announces a file already sitting under
+    ComfyUI's output directory (written by an upstream save-* node) so the
+    deploy worker uploads it as the run's artifact for ``output_id``.
+
+    The ``value`` socket is the filename as a STRING — optionally including
+    a subfolder prefix relative to ``folder_paths.get_output_directory()``.
+    Subfolder + basename are split before reporting so the worker's R2 key
+    stays ``runs/{run_id}/{output_id}/{basename}``."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "output_id": ("STRING", {"default": "file_output"}),
+                "output_name": ("STRING", {"default": ""}),
+                "value": ("STRING", {"forceInput": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+    CATEGORY = "Runflow/Output"
+
+    RUNFLOW_IO = "output"
+    RUNFLOW_TYPE = "FILE"
+
+    def save(self, output_id, output_name, value):
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                "RunflowOutputFile: `value` must be a non-empty filename string "
+                "relative to ComfyUI's output directory."
+            )
+
+        normalized = value.replace("\\", "/")
+        rel = PurePosixPath(normalized)
+        basename = rel.name
+        if not basename:
+            raise ValueError(
+                f"RunflowOutputFile: cannot derive a filename from value={value!r}."
+            )
+        subfolder = str(rel.parent) if rel.parent != PurePosixPath(".") else ""
+
+        output_dir = Path(folder_paths.get_output_directory()).resolve()
+        candidate = (output_dir / subfolder / basename).resolve()
+        if not candidate.is_relative_to(output_dir):
+            raise ValueError(
+                f"RunflowOutputFile: refusing path that escapes the output directory: {value!r}."
+            )
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"RunflowOutputFile: expected file at {candidate} (from value={value!r}); "
+                "did the upstream save node run?"
+            )
+
+        entry = {"filename": basename, "subfolder": subfolder, "type": "output"}
+        return {"ui": {"files": [entry]}, "result": (value,)}
+
+
 RUNFLOW_INPUT_CLASSES: dict[str, type] = {
     f"RunflowInput{t.capitalize()}": _make_input_class(t) for t in _INPUT_TYPES
 }
 
 RUNFLOW_OUTPUT_CLASSES: dict[str, type] = {
     "RunflowOutputImage": RunflowOutputImage,
+    "RunflowOutputFile": RunflowOutputFile,
 }
 
 

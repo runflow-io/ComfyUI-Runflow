@@ -43,6 +43,16 @@ The plugin sends `Authorization: Bearer <key>` and lets the API derive your orga
 
 The HTTP response is the terminal state — there is no separate deployment job to poll.
 
+## Workflow I/O
+
+Place a `Runflow Input (…)` node for each value your endpoint takes and a `Runflow Output (…)` node for each artifact it returns. The `input_id` / `output_id` widgets are the stable keys callers use against the API.
+
+| Node | Purpose |
+|------|---------|
+| `Runflow Input (String / Int / Float / Boolean / Image)` | Typed inputs. Locally each one is a pass-through; at deploy time the rewriter injects caller-supplied values. |
+| `Runflow Output (Image)` | Saves each image in the batch as PNG to ComfyUI's output directory. |
+| `Runflow Output (File)` | Marks a file already written under ComfyUI's `output/` directory (by an upstream save-* node) as the run's deliverable. Use for videos, 3D meshes, audio, archives, etc. Connect any node's filename/path string output to its `value` socket — subfolders relative to `output/` are supported. |
+
 ## Auto setup
 
 The **Auto setup** button (directly below Deploy on the Runflow Deploy node) installs every custom node and downloads every model the active workflow needs. Useful when you load someone else's workflow and don't want to chase its dependencies by hand.
