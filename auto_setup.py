@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -70,6 +71,57 @@ _STOCK_FRONTEND_NODES: frozenset[str] = frozenset(
         "MarkdownNote",
     }
 )
+
+
+# Module-top-level `from comfy_env import ... install ...` is the contract
+# opt-in for nodes that delegate their setup to the `comfy_env` package
+# (Pozzetti 3D-pipeline family: SAM3DObjects, GeometryPack, MoGe2, TRELLIS2,
+# HYPano2, Pixal3D, Hunyuan3D-Part, plus the comfyui-sharp pack). Matching
+# on the import (not on install.py existence alone) keeps us from running
+# legacy install.py scripts that do arbitrary work in nodes that happen to
+# ship one for unrelated reasons.
+#
+# Mirrors the deploy worker's identical guard at
+# `bg-brain/workers/comfyui-deploy-worker/installer.py:_is_comfy_env_install`.
+_COMFY_ENV_INSTALL_RE = re.compile(
+    r"^\s*from\s+comfy_env\s+import\b[^\n#]*\binstall\b",
+    re.MULTILINE,
+)
+
+
+def _is_comfy_env_install(install_py: Path) -> bool:
+    """True iff ``install.py`` exists in the cloned node directory and its source
+    imports ``install`` from ``comfy_env`` at module top level. Read errors → False."""
+    if not install_py.is_file():
+        return False
+    try:
+        text = install_py.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return _COMFY_ENV_INSTALL_RE.search(text) is not None
+
+
+def _aux_id_to_origin(aux_id: str) -> str | None:
+    """Convert a ComfyUI Manager-style ``aux_id`` to an HTTPS clone origin.
+
+    `properties.aux_id` is what ComfyUI's frontend stamps onto nodes installed
+    via Manager's git-URL flow (vs. Comfy Registry / cnr_id). Most often it's
+    a plain ``"owner/repo"`` string, occasionally a full ``https://github.com/...``
+    URL. Returns ``None`` for unrecognized shapes so the caller can fall through
+    to the next resolution path.
+    """
+    s = aux_id.strip()
+    if not s:
+        return None
+    if s.startswith(("http://", "https://")):
+        return s.rstrip("/")
+    # Plain `owner/repo` — be strict (exactly one slash, no shell metacharacters)
+    # so we don't build a malformed URL from corrupted properties.
+    if s.count("/") == 1 and all(c not in s for c in " \t?#&"):
+        owner, repo = s.split("/")
+        if owner and repo:
+            return f"https://github.com/{owner}/{repo}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -385,14 +437,6 @@ def _normalize_origin(url: str | None) -> str:
     return s.rstrip("/")
 
 
-def _installed_origins(installed: dict[str, dict]) -> set[str]:
-    return {
-        _normalize_origin(info.get("origin"))
-        for info in installed.values()
-        if info.get("origin")
-    }
-
-
 def _repo_name_from_origin(origin: str) -> str:
     """``https://github.com/owner/foo`` -> ``foo``."""
     norm = _normalize_origin(origin)
@@ -565,8 +609,6 @@ async def plan_setup(graph: dict) -> dict:
     Unresolved entries are class_types / filenames we couldn't map to a source.
     """
     registry = RegistryClient()
-    installed = RunflowDeploy.get_custom_nodes()
-    installed_origins = _installed_origins(installed)
     loaded_class_types = _comfy_core_class_types()
 
     # ---- Custom nodes ------------------------------------------------------
@@ -582,6 +624,7 @@ async def plan_setup(graph: dict) -> dict:
 
         props = node.get("properties") or {}
         cnr_id = props.get("cnr_id")
+        aux_id = props.get("aux_id")
         ver = props.get("ver")
 
         # Already runnable in this install? Skip.
@@ -609,6 +652,19 @@ async def plan_setup(graph: dict) -> dict:
                 source = "comfy_registry"
                 name = cnr_id
 
+        # `aux_id` carries the canonical `owner/repo` for nodes installed via
+        # Manager's git-URL flow. Try it before the class-type fallback because
+        # `ver` gives us an exact commit pin — the Manager list path can't.
+        # Real-world hit: personal-account packs (PozzettiAndrea/* family) that
+        # aren't in the Comfy Registry and aren't in Manager's curated list.
+        if not origin and isinstance(aux_id, str):
+            aux_origin = _aux_id_to_origin(aux_id)
+            if aux_origin:
+                origin = aux_origin
+                commit = ver or None
+                source = "aux_id"
+                name = _repo_name_from_origin(origin)
+
         if not origin and class_type:
             record = await registry.resolve_by_class_type(class_type)
             if record and record.get("repository"):
@@ -621,9 +677,13 @@ async def plan_setup(graph: dict) -> dict:
                 unresolved.append({"kind": "custom_node", "class_type": class_type})
             continue
 
+        # NOTE: no "directory exists locally → skip" guard here. The functional
+        # signal of "this node already works" is class_type ∈ loaded_class_types,
+        # which we already check above. If we got past that, the class didn't
+        # register — re-clone is the right action, even if the directory exists.
+        # install_custom_node_sync rmtree's the target before moving the fresh
+        # clone in, so re-install is safe.
         norm = _normalize_origin(origin)
-        if norm in installed_origins:
-            continue
         if norm in missing_nodes:
             # Prefer the entry with a commit pin if a later node carries one.
             if commit and not missing_nodes[norm].get("commit"):
@@ -635,6 +695,10 @@ async def plan_setup(graph: dict) -> dict:
             "commit": commit,
             "source": source,
         }
+        logger.info(
+            "Runflow auto-setup: planning install of %s (commit=%s, source=%s, class_type=%s)",
+            origin, (commit or "HEAD"), source, class_type,
+        )
 
     # ---- Models ------------------------------------------------------------
     models = resolve_workflow_models(graph or {})
@@ -913,6 +977,22 @@ def install_custom_node_sync(
                 if rc != 0:
                     raise RuntimeError(f"git checkout {commit[:12]}… failed (exit {rc})")
 
+        # Initialize any git submodules the node vendors (ComfyUI-3D-Pack
+        # vendors gsplat/nvdiffrast, Hunyuan3D-Part vendors model code, etc.).
+        # No-op when the repo has no .gitmodules — ~50ms; cheaper than the
+        # extra branch + stat call.
+        if is_cancelled():
+            raise CancelledByUser()
+        log_cb("git submodule update --init --recursive")
+        rc = _run_subprocess(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=target_in_staging,
+            log_cb=log_cb,
+            timeout=1800,
+        )
+        if rc != 0:
+            raise RuntimeError(f"git submodule update failed (exit {rc})")
+
         # Move into custom_nodes/. Replace any existing dir of the same name.
         final = custom_nodes_dir / name
         if final.exists():
@@ -933,6 +1013,27 @@ def install_custom_node_sync(
             )
             if rc != 0:
                 raise RuntimeError(f"pip install failed (exit {rc})")
+
+        # comfy-env nodes (Pozzetti 3D family, comfyui-sharp) need their
+        # isolated pixi envs materialized via `python install.py` after the
+        # pip step puts the `comfy_env` package itself into the venv.
+        # Without this, prestartup logs `[comfy-env] env: ... [MISSING --
+        # run install.py]` and the node's worker-isolated classes never
+        # register. Detector mirrors the deploy worker so behaviour stays
+        # in lockstep on both sides of the deploy boundary.
+        install_py = final / "install.py"
+        if _is_comfy_env_install(install_py):
+            if is_cancelled():
+                raise CancelledByUser()
+            log_cb("python install.py  (comfy-env isolated envs)")
+            rc = _run_subprocess(
+                [sys.executable, "install.py"],
+                cwd=final,
+                log_cb=log_cb,
+                timeout=3600,  # cold pixi pulls (flash-attn, nvdiffrast, ...) take minutes
+            )
+            if rc != 0:
+                raise RuntimeError(f"comfy-env install.py failed (exit {rc})")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
