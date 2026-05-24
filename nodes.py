@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -6,9 +7,21 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import aiohttp
 import folder_paths
 
 from ._git_info import read_git
+
+# tomllib is stdlib on 3.11+; fall back to the third-party `tomli` shim if
+# we're on 3.10 and it happens to be installed. If neither is available the
+# comfy-env hoisting pass degrades to a no-op (logged once at first call).
+try:
+    import tomllib as _tomllib  # type: ignore[import-not-found]
+except ImportError:
+    try:
+        import tomli as _tomllib  # type: ignore[import-not-found,no-redef]
+    except ImportError:
+        _tomllib = None  # type: ignore[assignment]
 
 
 logger = logging.getLogger(__name__)
@@ -525,3 +538,121 @@ class RunflowDeploy:
     def get_comfyui_git_info():
         info = read_git(Path(folder_paths.base_path))
         return {"origin": info.origin, "commit": info.commit, "dirty": info.dirty}
+
+
+# ---------------------------------------------------------------------------
+# comfy-env hoisting: turn `comfy-env-root.toml` [node_reqs] into manifest entries.
+#
+# The Pozzetti 3D-pipeline family (SAM3DObjects, Pixal3D, Hunyuan3D-Part, MoGe2,
+# HYPano2, TRELLIS2) declares cross-node dependencies in `comfy-env-root.toml`'s
+# `[node_reqs]` table, e.g.
+#     [node_reqs]
+#     ComfyUI-GeometryPack = "PozzettiAndrea/ComfyUI-GeometryPack"
+#
+# Without hoisting, those deps would only land on the worker if the user
+# happened to install them locally first. With hoisting, we resolve them at
+# deploy time so the manifest is self-contained and the runtime fingerprint
+# covers every clone the worker performs.
+# ---------------------------------------------------------------------------
+
+
+def _canonicalize_origin(url: str) -> str:
+    """Lowercase + strip trailing slash + drop a `.git` suffix so two spellings
+    of the same repo collapse to one key."""
+    cleaned = url.strip().rstrip("/").lower()
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+    return cleaned
+
+
+def _read_node_reqs(comfy_env_root_toml: Path) -> list[tuple[str, str]]:
+    """Return ``[(name, "owner/repo"), ...]`` from `comfy-env-root.toml`'s
+    `[node_reqs]` table. Empty list when the file is missing, the TOML parser
+    is unavailable on this Python, or the section is malformed — all soft
+    failures, never raised, so deploys keep working.
+    """
+    if _tomllib is None or not comfy_env_root_toml.is_file():
+        return []
+    try:
+        with comfy_env_root_toml.open("rb") as f:
+            data = _tomllib.load(f)
+    except (OSError, _tomllib.TOMLDecodeError):
+        return []
+    section = data.get("node_reqs") or {}
+    if not isinstance(section, dict):
+        return []
+    pairs: list[tuple[str, str]] = []
+    for name, value in section.items():
+        if isinstance(name, str) and isinstance(value, str) and "/" in value:
+            pairs.append((name, value.strip()))
+    return pairs
+
+
+async def _resolve_gh_head_commit(session: aiohttp.ClientSession, owner_repo: str) -> str | None:
+    """Best-effort GET ``https://api.github.com/repos/<owner_repo>/commits/HEAD``;
+    return the 40-char sha on success, ``None`` otherwise. Anonymous calls
+    against the GitHub API are rate-limited (60/hr/IP) — fine for a Deploy
+    button click, but a noisy retry loop would burn through that budget."""
+    try:
+        async with session.get(
+            f"https://api.github.com/repos/{owner_repo}/commits/HEAD",
+            timeout=aiohttp.ClientTimeout(total=10),
+            headers={"Accept": "application/vnd.github+json"},
+        ) as resp:
+            if resp.status != 200:
+                return None
+            payload = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    sha = payload.get("sha")
+    return sha if isinstance(sha, str) and len(sha) == 40 else None
+
+
+async def resolve_hoisted_custom_nodes(installed: dict[str, dict]) -> dict[str, dict]:
+    """Augment ``installed`` with custom-node dependencies declared via
+    `comfy-env-root.toml`'s ``[node_reqs]`` sections.
+
+    For each locally-installed node, parse its repo-root `comfy-env-root.toml`
+    and resolve every ``[node_reqs]`` entry that isn't already represented
+    (by canonicalized origin) into a manifest row with a GitHub HEAD commit.
+    Failed commit resolution skips the entry with a warning — the deploy
+    proceeds, and the worker fails loudly later if it really needed that node.
+    """
+    if not installed:
+        return installed
+
+    custom_dir = Path(folder_paths.base_path) / "custom_nodes"
+    known_origins = {_canonicalize_origin(meta["origin"]) for meta in installed.values()}
+    hoisted: dict[str, dict] = {}
+
+    async with aiohttp.ClientSession() as session:
+        for parent_name in list(installed):
+            toml_path = custom_dir / parent_name / "comfy-env-root.toml"
+            for req_name, owner_repo in _read_node_reqs(toml_path):
+                origin = f"https://github.com/{owner_repo}"
+                canonical = _canonicalize_origin(origin)
+                if canonical in known_origins:
+                    continue
+                commit = await _resolve_gh_head_commit(session, owner_repo)
+                if commit is None:
+                    logger.warning(
+                        "Runflow: comfy-env hoist skipped %s (could not resolve HEAD commit, parent=%s)",
+                        owner_repo, parent_name,
+                    )
+                    continue
+                known_origins.add(canonical)
+                hoisted[req_name] = {
+                    "origin": origin,
+                    "commit": commit,
+                    "dirty": False,
+                    "hoisted_from": parent_name,
+                }
+
+    if hoisted:
+        logger.info(
+            "Runflow: comfy-env hoist added %d node_reqs to deploy manifest: %s",
+            len(hoisted), sorted(hoisted),
+        )
+    return {**installed, **hoisted}

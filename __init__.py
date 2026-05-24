@@ -13,10 +13,14 @@ import aiohttp
 from aiohttp import web
 import folder_paths
 
-from .nodes import RunflowDeploy, resolve_workflow_models
+from .nodes import RunflowDeploy, resolve_hoisted_custom_nodes, resolve_workflow_models
 from .io_nodes import (
     NODE_CLASS_MAPPINGS as IO_NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as IO_NODE_DISPLAY_NAME_MAPPINGS,
+)
+from .save_nodes import (
+    NODE_CLASS_MAPPINGS as SAVE_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as SAVE_NODE_DISPLAY_NAME_MAPPINGS,
 )
 from . import auto_setup
 from server import PromptServer
@@ -26,11 +30,13 @@ logger = logging.getLogger(__name__)
 NODE_CLASS_MAPPINGS = {
     "RunflowDeploy": RunflowDeploy,
     **IO_NODE_CLASS_MAPPINGS,
+    **SAVE_NODE_CLASS_MAPPINGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RunflowDeploy": "Runflow Deploy",
     **IO_NODE_DISPLAY_NAME_MAPPINGS,
+    **SAVE_NODE_DISPLAY_NAME_MAPPINGS,
 }
 
 WEB_DIRECTORY = "./js"
@@ -299,11 +305,16 @@ async def post_resolve_models(request):
 
 @PromptServer.instance.routes.get("/runflow/system-info")
 async def get_system_info(request):
+    installed_nodes = RunflowDeploy.get_custom_nodes()
+    # Augment with comfy-env-root.toml [node_reqs] dependencies so the deploy
+    # manifest is self-contained even when a node's transitive deps haven't
+    # been installed locally yet (Pozzetti 3D-pipeline family).
+    deploy_nodes = await resolve_hoisted_custom_nodes(installed_nodes)
     return web.json_response({
         "packages": RunflowDeploy.get_installed_packages(),
         "cached_models": RunflowDeploy.get_cached_models(),
         "models_directory": RunflowDeploy.get_models_directory(),
-        "custom_nodes": RunflowDeploy.get_custom_nodes(),
+        "custom_nodes": deploy_nodes,
         "comfyui": RunflowDeploy.get_comfyui_git_info(),
     })
 
