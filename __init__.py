@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import uuid
 import zipfile
 
@@ -126,36 +127,142 @@ async def post_security(request):
     return web.json_response({"status": "ok"})
 
 
-SCAN_PORTS = [8188, 80, 8080, 443]
+# ---------------------------------------------------------------------------
+# Security: public port-exposure scan
+# ---------------------------------------------------------------------------
+#
+# ComfyUI ships no authentication by default and its custom nodes can execute
+# arbitrary code, so a ComfyUI instance reachable from the public internet is a
+# real remote-code-execution risk. This scan asks a public service whether the
+# machine's ports are reachable from the outside and warns the user.
+#
+# Robustness: the route never raises — it always returns HTTP 200 with a
+# structured body. Public-IP lookup falls back across several services; the
+# external port check is best-effort; and the listen-binding status (read
+# locally from ComfyUI's CLI args, no network needed) is *always* reported so
+# the UI can warn about exposure even when every external service is down.
+
+# Ports worth checking in addition to ComfyUI's own listen port.
+_EXTRA_SCAN_PORTS = [80, 8080, 443]
+
+# Public "what is my IP" services, tried in order until one returns an IPv4.
+_PUBLIC_IP_SERVICES = [
+    ("https://api.ipify.org?format=json", "json"),  # {"ip": "..."}
+    ("https://ifconfig.me/ip", "text"),
+    ("https://icanhazip.com", "text"),
+    ("https://checkip.amazonaws.com", "text"),
+]
+
+_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 
 
-@PromptServer.instance.routes.get("/runflow/public-ip")
-async def get_public_ip(request):
-    """Return the server's public IP address."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get("https://api.ipify.org?format=json") as resp:
-            data = await resp.json()
-            return web.json_response({"ip": data["ip"]})
+async def _detect_public_ip(session):
+    """Return the server's public IPv4, or None if every service fails."""
+    for url, kind in _PUBLIC_IP_SERVICES:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    continue
+                if kind == "json":
+                    data = await resp.json(content_type=None)
+                    ip = str((data or {}).get("ip", "")).strip()
+                else:
+                    ip = (await resp.text()).strip()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            continue
+        if _IPV4_RE.match(ip):
+            return ip
+    return None
+
+
+def _detect_listen():
+    """Return ``(listen, port, bound_all_interfaces)`` from ComfyUI's CLI args.
+
+    Guarded: if ``comfy.cli_args`` can't be imported we fall back to ComfyUI's
+    documented defaults (``127.0.0.1``:``8188`` — local-only). ``--listen`` with
+    no value binds ``0.0.0.0,::`` (all interfaces), the dangerous case.
+    """
+    listen, port = "127.0.0.1", 8188
+    try:
+        from comfy.cli_args import args
+        listen = str(getattr(args, "listen", None) or listen)
+        port = int(getattr(args, "port", None) or port)
+    except Exception:
+        logger.debug("Runflow: comfy.cli_args unavailable; assuming defaults", exc_info=True)
+    bound_all = ("0.0.0.0" in listen) or ("::" in listen)
+    return listen, port, bound_all
+
+
+async def _scan_via_portchecker(session, ip, ports):
+    """Primary external scanner (portchecker.io batch API).
+
+    Returns ``[{"port", "status"}, ...]`` or None if the service is unusable.
+    """
+    try:
+        async with session.post(
+            "https://portchecker.io/api/v1/query",
+            json={"host": ip, "ports": ports},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return None
+    check = (data or {}).get("check")
+    if not isinstance(check, list):
+        return None
+    out = []
+    for c in check:
+        try:
+            out.append({"port": int(c["port"]), "status": bool(c["status"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out or None
 
 
 @PromptServer.instance.routes.post("/runflow/port-scan")
 async def port_scan(request):
-    """Check if common ports are publicly reachable on the server's public IP."""
-    body = await request.json()
-    ip = body.get("ip", "")
-    if not ip:
-        return web.json_response({"error": "ip is required"}, status=400)
+    """Report whether this machine's ports are reachable from the public internet.
 
+    Never raises: returns HTTP 200 with a structured body. ``bound_all_interfaces``
+    (local, always known) lets the UI warn even when external services fail; a
+    non-null ``error`` signals that the external scan couldn't be completed.
+    """
+    listen, port, bound_all = _detect_listen()
+    ports = sorted({port, *_EXTRA_SCAN_PORTS})
+
+    ip = None
+    results = None
+    source = None
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://portchecker.io/api/v1/query",
-            json={"host": ip, "ports": SCAN_PORTS},
-        ) as resp:
-            data = await resp.json()
-            return web.json_response({
-                "ip": ip,
-                "ports": data.get("check", []),
-            })
+        ip = await _detect_public_ip(session)
+        if ip:
+            results = await _scan_via_portchecker(session, ip, ports)
+            if results is not None:
+                source = "portchecker.io"
+
+    body = {
+        "ip": ip,
+        "listen": listen,
+        "port": port,
+        "bound_all_interfaces": bound_all,
+        "scanned_ports": ports,
+        "source": source,
+        "ports": results or [],
+        "error": None,
+    }
+    if not ip:
+        body["error"] = (
+            "Could not determine this machine's public IP address — "
+            "check your internet connection."
+        )
+    elif results is None:
+        body["error"] = (
+            "The external port-check service is unavailable right now. "
+            "The listen-binding status below is still accurate."
+        )
+    return web.json_response(body)
 
 
 @PromptServer.instance.routes.post("/runflow/build-inputs-zip")

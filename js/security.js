@@ -7,6 +7,7 @@ import { app } from "../../scripts/app.js";
 const ID_ENABLED  = "Runflow.Auth.Enabled";
 const ID_USERNAME = "Runflow.Auth.Username";
 const ID_PASSWORD = "Runflow.Auth.Password";
+const ID_SCAN     = "Runflow.Security.PortScan";
 
 // ---------------------------------------------------------------------------
 // Sync ComfyUI settings → backend security file on every change
@@ -38,7 +39,29 @@ function debouncedSync() {
 }
 
 // ---------------------------------------------------------------------------
-// Port Scanner — injected into the settings panel via DOM manipulation
+// Small DOM helper (mirrors js/auto_setup.js el())
+// ---------------------------------------------------------------------------
+
+function el(tag, attrs = {}, ...children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+        if (k === "class") node.className = v;
+        else if (k === "style") Object.assign(node.style, v);
+        else if (k.startsWith("on") && typeof v === "function") {
+            node.addEventListener(k.slice(2).toLowerCase(), v);
+        } else if (v !== false && v != null) {
+            node.setAttribute(k, v);
+        }
+    }
+    for (const c of children) {
+        if (c == null || c === false) continue;
+        node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    }
+    return node;
+}
+
+// ---------------------------------------------------------------------------
+// Port-exposure scanner UI (mounted as a custom-rendered setting)
 // ---------------------------------------------------------------------------
 
 function injectStyles() {
@@ -46,186 +69,159 @@ function injectStyles() {
     const style = document.createElement("style");
     style.id = "rf-scan-css";
     style.textContent = `
-        #rf-port-scan {
-            margin-top: 20px;
-            padding: 16px;
-            border-top: 1px solid var(--border-color, #444);
-        }
-        #rf-port-scan h4 {
-            margin: 0 0 6px;
-            font-size: 14px;
-            color: var(--input-text, #ddd);
-        }
-        #rf-port-scan .rf-desc {
-            margin: 0 0 12px;
-            font-size: 13px;
+        .rf-port-scan { width: 100%; font-size: 13px; color: var(--input-text, #ddd); }
+        .rf-port-scan .rf-desc {
+            margin: 0 0 12px; font-size: 13px; line-height: 1.5;
             color: var(--descrip-text, #aaa);
         }
-        #rf-scan-btn {
-            padding: 8px 20px;
-            background: var(--p-primary-color, #4a9eff);
-            color: #fff;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 13px;
-            font-weight: 500;
+        .rf-scan-btn {
+            padding: 8px 20px; background: var(--p-primary-color, #4a9eff);
+            color: #fff; border: none; border-radius: 4px; cursor: pointer;
+            font-size: 13px; font-weight: 500;
         }
-        #rf-scan-btn:disabled {
-            opacity: 0.6;
-            cursor: default;
+        .rf-scan-btn:disabled { opacity: 0.6; cursor: default; }
+        .rf-scan-status { margin-top: 14px; line-height: 1.6; }
+        .rf-scan-status p { margin: 0 0 4px; }
+        .rf-scan-status table {
+            width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px;
         }
-        #rf-scan-status {
-            margin-top: 14px;
-            font-size: 13px;
-            color: var(--input-text, #ddd);
-            line-height: 1.6;
-        }
-        #rf-scan-status table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 8px;
-            font-size: 13px;
-        }
-        #rf-scan-status th {
-            text-align: left;
-            padding: 6px 10px;
+        .rf-scan-status th {
+            text-align: left; padding: 6px 10px;
             border-bottom: 1px solid var(--border-color, #444);
-            color: var(--descrip-text, #aaa);
-            font-weight: 500;
+            color: var(--descrip-text, #aaa); font-weight: 500;
         }
-        #rf-scan-status td {
-            padding: 6px 10px;
-            border-bottom: 1px solid var(--border-color, #333);
+        .rf-scan-status td {
+            padding: 6px 10px; border-bottom: 1px solid var(--border-color, #333);
         }
         .rf-port-open   { color: #ff5555; font-weight: 600; }
         .rf-port-closed { color: #50c878; font-weight: 600; }
+        .rf-bind-danger { color: #ff5555; font-weight: 600; }
+        .rf-bind-ok     { color: #50c878; font-weight: 600; }
         .rf-scan-spinner {
-            display: inline-block;
-            width: 14px;
-            height: 14px;
+            display: inline-block; width: 14px; height: 14px;
             border: 2px solid var(--border-color, #555);
             border-top-color: var(--p-primary-color, #4a9eff);
-            border-radius: 50%;
-            animation: rf-spin 0.8s linear infinite;
-            vertical-align: middle;
-            margin-right: 8px;
+            border-radius: 50%; animation: rf-spin 0.8s linear infinite;
+            vertical-align: middle; margin-right: 8px;
         }
         @keyframes rf-spin { to { transform: rotate(360deg); } }
         .rf-scan-summary {
-            margin-top: 10px;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: 500;
+            margin-top: 10px; padding: 8px 12px; border-radius: 4px;
+            font-size: 12px; font-weight: 500; line-height: 1.5;
         }
-        .rf-scan-summary.warn  { background: rgba(255,85,85,0.12); color: #ff5555; }
-        .rf-scan-summary.ok    { background: rgba(80,200,120,0.12); color: #50c878; }
+        .rf-scan-summary.warn { background: rgba(255,85,85,0.12); color: #ff5555; }
+        .rf-scan-summary.ok   { background: rgba(80,200,120,0.12); color: #50c878; }
+        .rf-scan-summary.info { background: rgba(74,158,255,0.12); color: var(--input-text, #ddd); }
     `;
     document.head.appendChild(style);
 }
 
-function createScanUI() {
+function buildScanUI() {
     injectStyles();
 
-    const div = document.createElement("div");
-    div.id = "rf-port-scan";
-    div.innerHTML = `
-        <h4>Port Scanner</h4>
-        <p class="rf-desc">
-            Check if common ports on this machine are reachable from the public internet.
-        </p>
-        <button id="rf-scan-btn">Security Scan</button>
-        <div id="rf-scan-status" style="display:none"></div>
-    `;
-    div.querySelector("#rf-scan-btn").addEventListener("click", runPortScan);
-    return div;
+    const status = el("div", { class: "rf-scan-status", style: { display: "none" } });
+    const btn = el("button", { class: "rf-scan-btn" }, "Run security scan");
+    btn.addEventListener("click", () => runPortScan(btn, status));
+
+    return el("div", { class: "rf-port-scan" },
+        el("p", { class: "rf-desc" },
+            "ComfyUI has no authentication by default, and custom nodes can run " +
+            "arbitrary code — so a ComfyUI port reachable from the public internet " +
+            "is a serious risk. This asks a public service whether this machine's " +
+            "ports are reachable from outside your network."),
+        btn,
+        status,
+    );
 }
 
-async function runPortScan() {
-    const btn    = document.getElementById("rf-scan-btn");
-    const status = document.getElementById("rf-scan-status");
-    if (!btn || !status) return;
-
+async function runPortScan(btn, status) {
+    const original = btn.textContent;
     btn.disabled = true;
-    btn.textContent = "Scanning\u2026";
+    btn.textContent = "Scanning…";
     status.style.display = "block";
-    status.innerHTML =
-        '<span class="rf-scan-spinner"></span> Detecting public IP address\u2026';
+    status.replaceChildren(
+        el("span", {},
+            el("span", { class: "rf-scan-spinner" }),
+            "Contacting port-check service…"),
+    );
 
     try {
-        // Step 1 — get server's public IP
-        const ipResp = await fetch("/runflow/public-ip");
-        if (!ipResp.ok) throw new Error("Failed to detect public IP");
-        const { ip } = await ipResp.json();
-
-        status.innerHTML =
-            `<span class="rf-scan-spinner"></span> Public IP: <strong>${ip}</strong> — checking ports\u2026`;
-
-        // Step 2 — scan ports from the internet via portchecker.io
-        const scanResp = await fetch("/runflow/port-scan", {
+        const resp = await fetch("/runflow/port-scan", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ ip }),
+            body: "{}",
         });
-        if (!scanResp.ok) throw new Error("Port scan request failed");
-        const data = await scanResp.json();
-
-        // Step 3 — render results
-        let html = `<p style="margin:0 0 4px">Public IP: <strong>${data.ip}</strong></p>`;
-        html += "<table><tr><th>Port</th><th>Status</th></tr>";
-        let anyOpen = false;
-        for (const p of data.ports) {
-            const open = p.status;
-            if (open) anyOpen = true;
-            const cls   = open ? "rf-port-open" : "rf-port-closed";
-            const label = open ? "OPEN" : "CLOSED";
-            html += `<tr><td>${p.port}</td><td class="${cls}">${label}</td></tr>`;
-        }
-        html += "</table>";
-
-        if (anyOpen) {
-            html += '<div class="rf-scan-summary warn">Open ports detected — consider enabling authentication or restricting access.</div>';
-        } else {
-            html += '<div class="rf-scan-summary ok">No open ports detected from the internet.</div>';
-        }
-        status.innerHTML = html;
+        const data = await resp.json();
+        status.replaceChildren(renderScanResult(data));
     } catch (e) {
-        status.innerHTML = `<span style="color:#ff5555">Error: ${e.message}</span>`;
+        status.replaceChildren(
+            el("div", { class: "rf-scan-summary warn" },
+                `Scan failed: ${e && e.message ? e.message : e}`),
+        );
+    } finally {
+        btn.disabled = false;
+        btn.textContent = original;
     }
-
-    btn.disabled = false;
-    btn.textContent = "Security Scan";
 }
 
-// Inject the port scanner section next to our authentication settings.
-// We locate our password input (type="password") and walk up to the section
-// container, then append the scanner at the bottom.
+function renderScanResult(data) {
+    const wrap = el("div");
 
-function injectPortScanner() {
-    if (document.getElementById("rf-port-scan")) return true;
+    // Listen binding — known locally, always reported.
+    const bindCls = data.bound_all_interfaces ? "rf-bind-danger" : "rf-bind-ok";
+    const bindText = data.bound_all_interfaces
+        ? `all interfaces (${data.listen}) — reachable from the network`
+        : `${data.listen} — local only`;
+    wrap.appendChild(
+        el("p", {}, "Listening on port ",
+            el("strong", {}, String(data.port)), ", bound to ",
+            el("span", { class: bindCls }, bindText)),
+    );
 
-    const pwInput = document.querySelector('input[type="password"]');
-    if (!pwInput) return false;
-
-    // Walk up until we find a container holding all our settings
-    let container = pwInput;
-    for (let i = 0; i < 15; i++) {
-        if (!container.parentElement) return false;
-        container = container.parentElement;
-        const controls = container.querySelectorAll(
-            'input, [role="switch"], [role="checkbox"]'
-        );
-        if (controls.length >= 3) break;
+    if (data.ip) {
+        wrap.appendChild(el("p", {}, "Public IP: ", el("strong", {}, data.ip)));
     }
 
-    container.appendChild(createScanUI());
-    return true;
+    // Per-port reachability table (present only when the external scan ran).
+    let anyOpen = false;
+    if (Array.isArray(data.ports) && data.ports.length) {
+        const rows = [el("tr", {}, el("th", {}, "Port"), el("th", {}, "Reachable from internet"))];
+        for (const p of data.ports) {
+            const open = Boolean(p.status);
+            if (open) anyOpen = true;
+            rows.push(el("tr", {},
+                el("td", {}, String(p.port)),
+                el("td", { class: open ? "rf-port-open" : "rf-port-closed" },
+                    open ? "OPEN" : "closed")));
+        }
+        wrap.appendChild(el("table", {}, ...rows));
+    }
+
+    // Summary banner.
+    if (data.error) {
+        const cls = data.bound_all_interfaces ? "warn" : "info";
+        let msg = data.error;
+        if (data.bound_all_interfaces) {
+            msg += " ComfyUI is bound to all network interfaces, so it may be " +
+                "exposed — enable authentication below or restrict access with a firewall.";
+        }
+        wrap.appendChild(el("div", { class: `rf-scan-summary ${cls}` }, msg));
+    } else if (anyOpen) {
+        wrap.appendChild(el("div", { class: "rf-scan-summary warn" },
+            "Open ports are reachable from the public internet. Enable password " +
+            "authentication below, restrict access with a firewall, or bind ComfyUI " +
+            "to 127.0.0.1 (remove --listen)."));
+    } else {
+        wrap.appendChild(el("div", { class: "rf-scan-summary ok" },
+            "None of the scanned ports are reachable from the public internet."));
+    }
+
+    return wrap;
 }
 
 // ---------------------------------------------------------------------------
-// Register settings under Settings → Runflow / Authentication
-// (reverse order — settings are prepended so last-registered appears first)
+// Register settings under Settings → Runflow
+// (auth controls + the custom-rendered port-exposure scanner)
 // ---------------------------------------------------------------------------
 
 app.registerExtension({
@@ -239,7 +235,7 @@ app.registerExtension({
             defaultValue: "",
             category: ["Runflow", "Authentication", "Password"],
             attrs: { type: "password" },
-            onChange: (newVal, oldVal) => { debouncedSync(); },
+            onChange: () => { debouncedSync(); },
         },
         {
             id: ID_USERNAME,
@@ -247,7 +243,7 @@ app.registerExtension({
             type: "text",
             defaultValue: "",
             category: ["Runflow", "Authentication", "Username"],
-            onChange: (newVal, oldVal) => { debouncedSync(); },
+            onChange: () => { debouncedSync(); },
         },
         {
             id: ID_ENABLED,
@@ -258,17 +254,20 @@ app.registerExtension({
             tooltip:
                 "Require HTTP Basic authentication for all requests. " +
                 "Both username and password must be set for this to take effect.",
-            onChange: (newVal, oldVal) => { debouncedSync(); },
+            onChange: () => { debouncedSync(); },
+        },
+        {
+            // Custom-rendered "setting": ComfyUI calls the render function and
+            // mounts the returned element directly in the settings panel — the
+            // supported replacement for the old, brittle DOM-injection.
+            id: ID_SCAN,
+            name: "Port exposure scan",
+            type: () => buildScanUI(),
+            defaultValue: "",
+            category: ["Runflow", "Authentication", "Port exposure scan"],
+            tooltip:
+                "Check whether this machine's ports are reachable from the " +
+                "public internet via a third-party port-check service.",
         },
     ],
-
-    async setup() {
-        // Watch for the settings panel to appear and inject the port scanner
-        if (injectPortScanner()) return;
-        const observer = new MutationObserver(() => {
-            if (injectPortScanner()) observer.disconnect();
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-        setTimeout(() => observer.disconnect(), 60_000);
-    },
 });

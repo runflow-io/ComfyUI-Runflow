@@ -1039,7 +1039,13 @@ def _fetch_node_via_git(
                 cwd=target, log_cb=log_cb, timeout=120,
             )
             if rc != 0:
-                raise RuntimeError(f"git checkout {commit[:12]}… failed (exit {rc})")
+                # Pinned commit/branch unreachable (deleted, rebased away, or
+                # force-pushed). Don't fail the install — keep the default-branch
+                # HEAD the clone already checked out.
+                log_cb(
+                    f"WARNING: could not check out {commit[:12]}… (exit {rc}); "
+                    "using the latest default-branch HEAD instead."
+                )
 
     # Initialize any git submodules the node vendors (ComfyUI-3D-Pack
     # vendors gsplat/nvdiffrast, Hunyuan3D-Part vendors model code, etc.).
@@ -1077,28 +1083,42 @@ def _fetch_node_via_tarball(
             "PATH) and retry."
         )
     owner, repo = slug
-    ref = commit or "HEAD"
     # GitHub's API tarball endpoint redirects to codeload and works
-    # unauthenticated for public repos; `ref` accepts a SHA, tag, or branch
-    # (HEAD = default branch).
-    url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{ref}"
-    log_cb(
-        f"git unavailable — downloading tarball {owner}/{repo}@"
-        f"{commit[:12] if commit else 'HEAD'}"
-    )
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "ComfyUI-Runflow-auto-setup",
-        "Accept": "application/vnd.github+json",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            data = resp.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(
-            f"tarball download failed (HTTP {exc.code}) for {url}"
-        ) from exc
-    except (urllib.error.URLError, OSError) as exc:
-        raise RuntimeError(f"tarball download failed for {url}: {exc}") from exc
+    # unauthenticated for public repos; a ref accepts a SHA, tag, or branch
+    # (HEAD = default branch). Prefer the pinned commit, but fall back to HEAD
+    # when that ref can't be fetched (deleted/rebased/force-pushed) — mirrors
+    # the git path's "use HEAD" behaviour.
+    refs = [commit, "HEAD"] if commit and commit != "HEAD" else ["HEAD"]
+    data = None
+    last_exc: Exception | None = None
+    for ref in refs:
+        label = "HEAD" if ref == "HEAD" else ref[:12]
+        url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{ref}"
+        log_cb(f"git unavailable — downloading tarball {owner}/{repo}@{label}")
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "ComfyUI-Runflow-auto-setup",
+            "Accept": "application/vnd.github+json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                data = resp.read()
+            break
+        except urllib.error.HTTPError as exc:
+            last_exc = RuntimeError(
+                f"tarball download failed (HTTP {exc.code}) for {url}"
+            )
+            if ref != "HEAD":
+                log_cb(
+                    f"WARNING: tarball for {label} unavailable (HTTP {exc.code}); "
+                    "falling back to HEAD"
+                )
+                continue
+        except (urllib.error.URLError, OSError) as exc:
+            # Network-level failure — retrying a different ref won't help.
+            last_exc = RuntimeError(f"tarball download failed for {url}: {exc}")
+            break
+    if data is None:
+        raise last_exc or RuntimeError("tarball download failed")
 
     if is_cancelled():
         raise CancelledByUser()
