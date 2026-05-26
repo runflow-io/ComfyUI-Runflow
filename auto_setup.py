@@ -8,19 +8,28 @@ Resolution sources:
   resolver in ``nodes.py`` populates this), with Manager's ``model-list.json``
   as a filename-keyed fallback.
 
-Cross-platform: assumes only ``python``, ``pip``, and ``git`` on PATH.
+Cross-platform: Python tooling is always invoked as ``sys.executable -m pip``
+/ ``sys.executable install.py`` (never a bare ``pip``/``python``, which aren't
+on PATH for ComfyUI Desktop / uv-managed / portable installs). ``git`` is
+located via :func:`_resolve_git` (PATH + common per-OS install dirs); when it's
+genuinely absent we fall back to downloading a GitHub source tarball.
 """
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
+import io
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
@@ -906,6 +915,217 @@ def _run_subprocess(
     return proc.returncode
 
 
+@functools.lru_cache(maxsize=1)
+def _resolve_git() -> str | None:
+    """Locate a working ``git`` executable, or return ``None`` if absent.
+
+    ComfyUI Desktop (Mac/Windows) and the Windows portable build don't put git
+    on PATH, so :func:`shutil.which` alone misses it. We additionally probe the
+    common per-OS install locations, then *verify* the candidate actually runs
+    (``git --version``): on macOS ``/usr/bin/git`` is a stub that exists even
+    with no developer tools installed and only errors when invoked, so file
+    existence isn't enough. Result is cached for the process.
+    """
+    candidates: list[str] = []
+    on_path = shutil.which("git")
+    if on_path:
+        candidates.append(on_path)
+    if sys.platform == "win32":
+        candidates += [
+            os.path.expandvars(r"%PROGRAMFILES%\Git\cmd\git.exe"),
+            os.path.expandvars(r"%PROGRAMFILES(X86)%\Git\cmd\git.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\cmd\git.exe"),
+        ]
+    elif sys.platform == "darwin":
+        candidates += [
+            "/opt/homebrew/bin/git",   # Apple-silicon Homebrew
+            "/usr/local/bin/git",      # Intel Homebrew / git-scm installer
+            "/usr/bin/git",            # Xcode CLT (may be a no-toolchain stub)
+            "/Library/Developer/CommandLineTools/usr/bin/git",
+        ]
+    else:
+        candidates += ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"]
+
+    seen: set[str] = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        # which() results are already known-present; probe paths must exist.
+        if cand != on_path and not Path(cand).is_file():
+            continue
+        try:
+            probe = subprocess.run(
+                [cand, "--version"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return cand
+    return None
+
+
+def _github_slug(origin: str) -> tuple[str, str] | None:
+    """Return ``(owner, repo)`` for a github.com origin, else ``None``."""
+    norm = _normalize_origin(origin)  # -> host/path, lowercased, no .git
+    prefix = "github.com/"
+    if not norm.startswith(prefix):
+        return None
+    parts = [p for p in norm[len(prefix):].split("/") if p]
+    if len(parts) < 2:
+        return None
+    return parts[0], parts[1]
+
+
+def _safe_extract_tar(tf: tarfile.TarFile, dest: Path) -> None:
+    """Extract ``tf`` into ``dest``, rejecting members that escape ``dest``."""
+    dest = dest.resolve()
+    base = str(dest) + os.sep
+    for member in tf.getmembers():
+        target = (dest / member.name).resolve()
+        if target != dest and not str(target).startswith(base):
+            raise RuntimeError(f"unsafe path in tarball: {member.name!r}")
+    try:
+        tf.extractall(dest, filter="data")  # type: ignore[call-arg]  # py3.12+
+    except TypeError:
+        tf.extractall(dest)
+
+
+def _fetch_node_via_git(
+    git: str,
+    origin: str,
+    commit: str | None,
+    target: Path,
+    log_cb: Callable[[str], None],
+    is_cancelled: Callable[[], bool],
+) -> None:
+    """Clone ``origin`` (and checkout ``commit``) into ``target`` using ``git``."""
+    log_cb(f"git clone {origin}")
+    rc = _run_subprocess(
+        [git, "clone", "--depth=1", origin, str(target)],
+        cwd=None, log_cb=log_cb, timeout=600,
+    )
+    if rc != 0:
+        raise RuntimeError(f"git clone failed (exit {rc})")
+
+    if commit:
+        if is_cancelled():
+            raise CancelledByUser()
+        log_cb(f"git checkout {commit[:12]}…")
+        rc = _run_subprocess(
+            [git, "fetch", "--depth=1", "origin", commit],
+            cwd=target, log_cb=log_cb, timeout=300,
+        )
+        if rc == 0:
+            rc = _run_subprocess(
+                [git, "checkout", commit],
+                cwd=target, log_cb=log_cb, timeout=120,
+            )
+        if rc != 0:
+            # Fallback: full clone, then checkout. Some hosts disable
+            # uploadpack.allowReachableSHA1InWant, which makes the
+            # depth-1 fetch above reject the SHA.
+            log_cb("falling back to full clone")
+            shutil.rmtree(target, ignore_errors=True)
+            rc = _run_subprocess(
+                [git, "clone", origin, str(target)],
+                cwd=None, log_cb=log_cb, timeout=900,
+            )
+            if rc != 0:
+                raise RuntimeError(f"git clone (full) failed (exit {rc})")
+            rc = _run_subprocess(
+                [git, "checkout", commit],
+                cwd=target, log_cb=log_cb, timeout=120,
+            )
+            if rc != 0:
+                raise RuntimeError(f"git checkout {commit[:12]}… failed (exit {rc})")
+
+    # Initialize any git submodules the node vendors (ComfyUI-3D-Pack
+    # vendors gsplat/nvdiffrast, Hunyuan3D-Part vendors model code, etc.).
+    # No-op when the repo has no .gitmodules — ~50ms; cheaper than the
+    # extra branch + stat call.
+    if is_cancelled():
+        raise CancelledByUser()
+    log_cb("git submodule update --init --recursive")
+    rc = _run_subprocess(
+        [git, "submodule", "update", "--init", "--recursive"],
+        cwd=target, log_cb=log_cb, timeout=1800,
+    )
+    if rc != 0:
+        raise RuntimeError(f"git submodule update failed (exit {rc})")
+
+
+def _fetch_node_via_tarball(
+    origin: str,
+    commit: str | None,
+    target: Path,
+    log_cb: Callable[[str], None],
+    is_cancelled: Callable[[], bool],
+) -> None:
+    """Download + extract a GitHub source tarball into ``target`` (no git).
+
+    Used only when :func:`_resolve_git` finds no usable git binary. Submodules
+    are *not* fetched (tarballs don't include them) — we warn when the node
+    vendors any so the limitation is explicit rather than silent.
+    """
+    slug = _github_slug(origin)
+    if slug is None:
+        raise RuntimeError(
+            f"git is not installed and {origin!r} is not a GitHub repository, "
+            "so it cannot be fetched without git. Install git (or add it to "
+            "PATH) and retry."
+        )
+    owner, repo = slug
+    ref = commit or "HEAD"
+    # GitHub's API tarball endpoint redirects to codeload and works
+    # unauthenticated for public repos; `ref` accepts a SHA, tag, or branch
+    # (HEAD = default branch).
+    url = f"https://api.github.com/repos/{owner}/{repo}/tarball/{ref}"
+    log_cb(
+        f"git unavailable — downloading tarball {owner}/{repo}@"
+        f"{commit[:12] if commit else 'HEAD'}"
+    )
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "ComfyUI-Runflow-auto-setup",
+        "Accept": "application/vnd.github+json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"tarball download failed (HTTP {exc.code}) for {url}"
+        ) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(f"tarball download failed for {url}: {exc}") from exc
+
+    if is_cancelled():
+        raise CancelledByUser()
+
+    # GitHub tarballs wrap everything in a single top-level dir
+    # (`{owner}-{repo}-{sha7}/`); extract, then lift that dir into `target`.
+    extract_root = target.parent / f"{target.name}__tar"
+    shutil.rmtree(extract_root, ignore_errors=True)
+    extract_root.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            _safe_extract_tar(tf, extract_root)
+        subdirs = [p for p in extract_root.iterdir() if p.is_dir()]
+        src_dir = subdirs[0] if len(subdirs) == 1 else extract_root
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        shutil.move(str(src_dir), str(target))
+    finally:
+        shutil.rmtree(extract_root, ignore_errors=True)
+
+    if (target / ".gitmodules").is_file():
+        log_cb(
+            "WARNING: this node declares git submodules, which the tarball "
+            "fallback cannot fetch. Install git for a complete install."
+        )
+
+
 def install_custom_node_sync(
     origin: str,
     commit: str | None,
@@ -914,12 +1134,13 @@ def install_custom_node_sync(
     log_cb: Callable[[str], None],
     is_cancelled: Callable[[], bool],
 ) -> None:
-    """Clone ``origin`` and checkout ``commit`` into ``custom_nodes/<name>/``.
+    """Fetch ``origin`` at ``commit`` into ``custom_nodes/<name>/``.
 
     Runs entirely synchronously — call via ``asyncio.to_thread`` from async code.
-    Uses ``git clone --depth=1`` + ``git fetch --depth=1 origin <sha>`` for the
-    fast path, and falls back to a full clone if SHA-targeted fetch fails.
-    Then ``python -m pip install -r requirements.txt`` if that file is present.
+    Prefers git (clone --depth=1 + SHA-targeted fetch, with a full-clone
+    fallback); when no git binary is available it downloads a GitHub source
+    tarball instead. Then ``python -m pip install -r requirements.txt`` if that
+    file is present, and ``python install.py`` for comfy-env nodes.
     """
     if is_cancelled():
         raise CancelledByUser()
@@ -927,71 +1148,16 @@ def install_custom_node_sync(
     staging = Path(tempfile.mkdtemp(prefix="runflow-cn-"))
     target_in_staging = staging / name
     try:
-        log_cb(f"git clone {origin}")
-        rc = _run_subprocess(
-            ["git", "clone", "--depth=1", origin, str(target_in_staging)],
-            cwd=None,
-            log_cb=log_cb,
-            timeout=600,
-        )
-        if rc != 0:
-            raise RuntimeError(f"git clone failed (exit {rc})")
-
-        if commit:
-            if is_cancelled():
-                raise CancelledByUser()
-            log_cb(f"git checkout {commit[:12]}…")
-            rc = _run_subprocess(
-                ["git", "fetch", "--depth=1", "origin", commit],
-                cwd=target_in_staging,
-                log_cb=log_cb,
-                timeout=300,
+        git = _resolve_git()
+        if git is not None:
+            _fetch_node_via_git(
+                git, origin, commit, target_in_staging, log_cb, is_cancelled,
             )
-            if rc == 0:
-                rc = _run_subprocess(
-                    ["git", "checkout", commit],
-                    cwd=target_in_staging,
-                    log_cb=log_cb,
-                    timeout=120,
-                )
-            if rc != 0:
-                # Fallback: full clone, then checkout. Some hosts disable
-                # uploadpack.allowReachableSHA1InWant, which makes the
-                # depth-1 fetch above reject the SHA.
-                log_cb("falling back to full clone")
-                shutil.rmtree(target_in_staging, ignore_errors=True)
-                rc = _run_subprocess(
-                    ["git", "clone", origin, str(target_in_staging)],
-                    cwd=None,
-                    log_cb=log_cb,
-                    timeout=900,
-                )
-                if rc != 0:
-                    raise RuntimeError(f"git clone (full) failed (exit {rc})")
-                rc = _run_subprocess(
-                    ["git", "checkout", commit],
-                    cwd=target_in_staging,
-                    log_cb=log_cb,
-                    timeout=120,
-                )
-                if rc != 0:
-                    raise RuntimeError(f"git checkout {commit[:12]}… failed (exit {rc})")
-
-        # Initialize any git submodules the node vendors (ComfyUI-3D-Pack
-        # vendors gsplat/nvdiffrast, Hunyuan3D-Part vendors model code, etc.).
-        # No-op when the repo has no .gitmodules — ~50ms; cheaper than the
-        # extra branch + stat call.
-        if is_cancelled():
-            raise CancelledByUser()
-        log_cb("git submodule update --init --recursive")
-        rc = _run_subprocess(
-            ["git", "submodule", "update", "--init", "--recursive"],
-            cwd=target_in_staging,
-            log_cb=log_cb,
-            timeout=1800,
-        )
-        if rc != 0:
-            raise RuntimeError(f"git submodule update failed (exit {rc})")
+        else:
+            log_cb("git not found on PATH or common locations — using tarball fallback")
+            _fetch_node_via_tarball(
+                origin, commit, target_in_staging, log_cb, is_cancelled,
+            )
 
         # Move into custom_nodes/. Replace any existing dir of the same name.
         final = custom_nodes_dir / name
