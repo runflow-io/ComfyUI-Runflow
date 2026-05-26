@@ -80,3 +80,34 @@ When the job finishes, click **Restart ComfyUI** in the modal: the server re-exe
 ### Requirements
 
 Auto setup assumes `python`, `pip`, and `git` are on PATH. It uses `git clone --depth=1` + `git fetch --depth=1 origin <sha>` + `git checkout <sha>` (falling back to a full clone if the host disables SHA-targeted fetches), then `python -m pip install -r requirements.txt` if the cloned repo carries one. Works on Linux, macOS, and Windows.
+
+## Security
+
+ComfyUI ships **no authentication** by default, and custom nodes can execute arbitrary code on the host. If you start ComfyUI with `--listen` (binding to `0.0.0.0`, i.e. all network interfaces) and the port is reachable from the public internet, anyone who finds it can run code on your machine. The Runflow security panel helps you detect and close that exposure.
+
+In ComfyUI: **Settings → Runflow → Authentication**.
+
+### Password authentication
+
+| Setting | Default | What it is |
+|---------|---------|-----------|
+| `Enable password authentication` | _off_ | Require HTTP Basic auth for **all** requests to this ComfyUI server. |
+| `Username` / `Password` | _(empty)_ | Credentials checked by the auth layer. |
+
+When enabled with both a username and password set, a Basic-auth middleware guards every route (the credentials are stored in `runflow_security.json` next to your ComfyUI install). Browsers prompt once and cache the credentials for the session.
+
+### Port exposure scan
+
+Click **Run security scan** in the same panel to check whether this machine is exposed:
+
+1. It reports ComfyUI's **listen binding** (read locally from ComfyUI's `--listen` / `--port` args). Binding to `0.0.0.0`/`::` (all interfaces) is flagged in red; `127.0.0.1` (local only) is green.
+2. It looks up your **public IP** (via `api.ipify.org`, falling back to `ifconfig.me`, `icanhazip.com`, and `checkip.amazonaws.com`).
+3. It asks the public service **portchecker.io** whether your ComfyUI port (plus `80`, `8080`, `443`) is reachable from the internet, and shows each port as OPEN or closed.
+
+> **Privacy note:** the scan sends your public IP address to the third-party service portchecker.io so it can probe your ports from the outside. No workflow data is sent. If the external service is unreachable, the scan still reports the local listen-binding status so you aren't left without a signal.
+
+**If a port shows OPEN** (or you're bound to all interfaces), close the exposure by any of:
+
+- Enabling **password authentication** above.
+- Restricting access with a firewall / security group, or putting ComfyUI behind an authenticated reverse proxy.
+- Binding to localhost only — start ComfyUI **without** `--listen` (or with `--listen 127.0.0.1`).

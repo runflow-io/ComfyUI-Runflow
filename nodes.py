@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -460,13 +461,50 @@ class RunflowDeploy:
 
     @staticmethod
     def get_installed_packages():
-        result = subprocess.run(
-            ["pip", "list", "--format=json"],
-            capture_output=True, text=True,
-        )
+        """List packages installed in the running ComfyUI environment.
+
+        Returns ``pip list --format=json`` shape: ``[{"name", "version"}, ...]``.
+
+        Reads metadata straight from the live interpreter via
+        ``importlib.metadata`` instead of shelling out to ``pip``. A bare
+        ``pip`` is not on PATH for many installs (ComfyUI desktop, uv-managed
+        and portable/embedded Python expose only ``pip3``/``pip3.12`` inside a
+        venv bin the host process doesn't inherit), so the old
+        ``subprocess.run(["pip", ...])`` raised ``FileNotFoundError`` and the
+        ``/runflow/system-info`` route 500'd. Reading metadata is also faster
+        and works even when ``pip`` isn't installed at all.
+        """
+        packages = []
+        seen = set()
         try:
+            from importlib import metadata as importlib_metadata
+
+            for dist in importlib_metadata.distributions():
+                name = dist.metadata["Name"]
+                if not name:
+                    continue
+                key = name.lower()
+                if key in seen:  # de-dup like pip (e.g. dual site-packages)
+                    continue
+                seen.add(key)
+                packages.append({"name": name, "version": dist.version})
+        except Exception:
+            logger.exception("Runflow: importlib.metadata enumeration failed")
+
+        if packages:
+            return packages
+
+        # Fallback for the rare environment where metadata enumeration yields
+        # nothing. Always invoke pip through the current interpreter
+        # (sys.executable -m pip) — never a bare `pip` that may be off PATH.
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "list", "--format=json"],
+                capture_output=True, text=True,
+            )
             return json.loads(result.stdout)
-        except json.JSONDecodeError:
+        except Exception:
+            logger.exception("Runflow: pip fallback for package list failed")
             return []
 
     @staticmethod
