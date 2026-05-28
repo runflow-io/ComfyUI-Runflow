@@ -7,7 +7,7 @@ A ComfyUI custom-node plugin that publishes a workflow to [Runflow](https://runf
 [**Documentation**](https://docs.runflow.io/guides/comfyui-deploy) · [**API Reference**](https://docs.runflow.io) · [**Pricing**](https://www.runflow.io/pricing) · [**Releases**](https://github.com/runflow-io/ComfyUI-Runflow/releases)
 
 <p align="center">
-  <img src="https://mintcdn.com/runflow-b8be4ef4/Kdf0t-butT19tY6U/images/rf_comfynode_deploy_zoom.png" alt="The Runflow Deploy node in ComfyUI" width="640" />
+  <img src="docs/assets/rf_comfynode_deploy_zoom.png" alt="The Runflow Deploy node in ComfyUI" width="640" />
 </p>
 
 ---
@@ -101,7 +101,7 @@ A `Deployed ✓` toast confirms success; failures surface as browser alerts with
 Place a typed `Runflow Input (…)` node for each value your endpoint accepts and a `Runflow Output (…)` node for each artifact it returns. The `input_id` / `output_id` widgets are the stable keys callers use against the API.
 
 <p align="center">
-  <img src="https://mintcdn.com/runflow-b8be4ef4/V73Ct6X8YxRrRg6_/images/comfyui_runflow_custom_nodes.png" alt="A ComfyUI workflow with Runflow Input and Output nodes" width="720" />
+  <img src="docs/assets/comfyui_runflow_custom_nodes.png" alt="A ComfyUI workflow with Runflow Input and Output nodes" width="720" />
 </p>
 
 ### Input nodes
@@ -202,13 +202,13 @@ See [runflow.io/pricing](https://www.runflow.io/pricing) for current rates. Work
 The **Auto setup** button (directly below Deploy on the Runflow Deploy node) installs every custom node and downloads every model the active workflow needs. Useful when you load someone else's workflow and don't want to chase dependencies by hand.
 
 <p align="center">
-  <img src="https://mintcdn.com/runflow-b8be4ef4/Kdf0t-butT19tY6U/images/rf_auto_setup_start.png" alt="Auto setup modal with checkboxes for custom nodes and models" width="560" />
+  <img src="docs/assets/rf_auto_setup_start.png" alt="Auto setup modal with checkboxes for custom nodes and models" width="560" />
 </p>
 
 Clicking the button opens a modal with two checkboxes — *Install missing custom nodes* and *Download missing models* — and a Start button. While the job runs, the modal shows a byte-progress bar for the current download and a count-progress bar for the current custom-node install. Models and custom nodes run in parallel.
 
 <p align="center">
-  <img src="https://mintcdn.com/runflow-b8be4ef4/Kdf0t-butT19tY6U/images/rf_auto_setup_progress.png" alt="Auto setup progress modal showing parallel installs and downloads" width="560" />
+  <img src="docs/assets/rf_auto_setup_progress.png" alt="Auto setup progress modal showing parallel installs and downloads" width="560" />
 </p>
 
 When the job finishes, click **Restart ComfyUI** in the modal: the server re-execs itself, the modal waits for it to come back, and the page full-reloads so the newly installed nodes register.
@@ -226,7 +226,7 @@ Auto setup assumes `python`, `pip`, and `git` are on PATH. It uses `git clone --
 ComfyUI ships **no authentication** by default, and custom nodes can execute arbitrary code on the host. If you start ComfyUI with `--listen` (binding to `0.0.0.0` — all network interfaces) and the port is reachable from the public internet, anyone who finds it can run code on your machine. The Runflow security panel helps you detect and close that exposure.
 
 <p align="center">
-  <img src="https://mintcdn.com/runflow-b8be4ef4/Kdf0t-butT19tY6U/images/rf_settings_panel.png" alt="The Runflow settings panel under ComfyUI Settings" width="720" />
+  <img src="docs/assets/rf_settings_panel.png" alt="The Runflow settings panel under ComfyUI Settings" width="720" />
 </p>
 
 ### Password authentication
@@ -243,7 +243,7 @@ When enabled with both fields set, a Basic-auth middleware guards every route. C
 Click **Run security scan** in the same panel to check whether this machine is exposed from the public internet:
 
 <p align="center">
-  <img src="https://mintcdn.com/runflow-b8be4ef4/Kdf0t-butT19tY6U/images/rf_port_exposure_scan.png" alt="Port exposure scan results showing listen binding and external port status" width="720" />
+  <img src="docs/assets/rf_port_exposure_scan.png" alt="Port exposure scan results showing listen binding and external port status" width="720" />
 </p>
 
 1. It reports ComfyUI's **listen binding** (read locally from ComfyUI's `--listen` / `--port` args). Binding to `0.0.0.0`/`::` is flagged in red; `127.0.0.1` is green.
