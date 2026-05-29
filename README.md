@@ -96,6 +96,32 @@ A `Deployed ✓` toast confirms success; failures surface as browser alerts with
 
 ---
 
+## Local Playground
+
+The **Local Playground** button (directly below Deploy on the Runflow Deploy node) opens a clean, brand-styled web app on the same ComfyUI host that lets you exercise the workflow through its `Runflow Input` / `Runflow Output` surface — a form on the left, a media preview on the right — without ever touching the node graph. Useful for sanity-checking what your API actually looks like before you ship it.
+
+**Open it:** click **Local Playground** on the Deploy node. A new tab opens at `http://<comfy-host>/runflow/playground/<slug>`, where `<slug>` is derived from `endpoint_name` the same way Deploy derives it (`Background Removal v2.1` → `background-removal-v21`).
+
+**Form:** generated from the workflow's `Runflow Input (…)` nodes. The `display_name` widget is the field label, the `description` widget is the helper text, and the input type comes from the node class. Booleans render as a switch; numbers as a number input; images as a file picker that uploads through ComfyUI's built-in `/upload/image` (the file lands in `ComfyUI/input/`, and the uploaded filename is what the workflow receives).
+
+**Run:** click **Run**. The plugin takes a copy of the captured workflow, **disconnects** the `value` link on every `Runflow Input` node — exactly the same scrubbing rule Deploy uses to detach the local test wiring — and **replaces it with the form value** (or, for image inputs, a freshly-injected `LoadImage` node pointed at the uploaded file). The graph then runs against the local ComfyUI via `/prompt`, drains `/ws` until completion, and pulls outputs from `/history`.
+
+**Preview:** the right panel renders per `Runflow Output`:
+
+- `Runflow Output (Image)` → inline image
+- `Runflow Output (File)` chained from a video saver → inline `<video controls>`
+- `Runflow Output (File)` chained from an audio saver → inline `<audio controls>`
+- `Runflow Output (File)` for `.glb` / `.gltf` meshes → in-browser 3D viewer (`<model-viewer>`, lazy-loaded from a CDN the first time a 3D output appears)
+- Anything else (`.obj`, `.ply`, `.stl`, archives, etc.) → download link
+
+**Captures are in-memory.** Restarting ComfyUI clears the playground; click **Local Playground** again to recapture. Editing the graph after capture also drifts — the playground always runs the *captured* graph, so reopen if you've changed things.
+
+**Auth:** if you've enabled password authentication in the Runflow security panel, the same Basic-auth prompt that protects the rest of ComfyUI also protects the playground page and its run endpoints.
+
+> The button is intentionally a local-only tester. To run a workflow through the public Runflow API, use **Deploy** and call the endpoint over HTTPS as documented under [Calling your deployed workflow](#calling-your-deployed-workflow).
+
+---
+
 ## Define your API: Runflow Input / Output nodes
 
 Place a typed `Runflow Input (…)` node for each value your endpoint accepts and a `Runflow Output (…)` node for each artifact it returns. The `input_id` / `output_id` widgets are the stable keys callers use against the API.

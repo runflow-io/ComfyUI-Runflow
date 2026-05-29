@@ -382,6 +382,54 @@ async function runWorkflow(node) {
     watchRun(node, host, apiKey, run.id);
 }
 
+// ---------- local playground ----------
+
+// Capture the live workflow under `endpoint_name`'s slug, then open the
+// in-process playground in a new tab. The playground page is served by the
+// plugin itself (see __init__.py "Local Playground" section) and runs the
+// workflow with disconnected `RunflowInput*.value` sockets replaced by
+// form-provided values.
+async function openLocalPlayground(node) {
+    const endpointName = node.widgets.find(w => w.name === "endpoint_name")?.value || "default";
+    const slug = slugify(endpointName);
+    if (!slug) {
+        alert(
+            "Runflow: endpoint name must be URL-safe (a-z, 0-9, '-', '_') " +
+            "to open the local playground."
+        );
+        return;
+    }
+    // Keep the "Local Playground" prefix on the label so the restore below can
+    // still find the widget via `setButtonLabel`'s prefix lookup.
+    setButtonLabel(node, "Local Playground", "Local Playground…");
+    try {
+        const { output, workflow } = await app.graphToPrompt();
+        const resp = await fetch(`/runflow/playground/workflows/${encodeURIComponent(slug)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                workflow_json: output,
+                graph: workflow,
+                endpoint_name: endpointName,
+            }),
+        });
+        if (!resp.ok) {
+            let detail = `HTTP ${resp.status}`;
+            try {
+                const body = await resp.json();
+                if (body && body.error) detail = body.error;
+            } catch { /* not JSON */ }
+            alert(`Runflow: could not prepare playground — ${detail}`);
+            return;
+        }
+        window.open(`/runflow/playground/${encodeURIComponent(slug)}`, "_blank", "noopener");
+    } catch (err) {
+        alert(`Runflow: could not prepare playground — ${err.message || err}`);
+    } finally {
+        setButtonLabel(node, "Local Playground", "Local Playground");
+    }
+}
+
 app.registerExtension({
     name: "Runflow.Deploy",
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -394,6 +442,7 @@ app.registerExtension({
         // API ships. Uncomment once runWorkflow() is wired to the live endpoint.
         // node.addWidget("button", "Run (deploy first)", null, () => runWorkflow(node));
         node.addWidget("button", "Deploy", null, () => deployWorkflow(node));
+        node.addWidget("button", "Local Playground", null, () => openLocalPlayground(node));
         node.addWidget("button", "Auto setup", null, () => openAutoSetupModal());
     },
 });

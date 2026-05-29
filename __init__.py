@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -7,8 +8,11 @@ import logging
 import mimetypes
 import os
 import re
+import time
+import urllib.parse
 import uuid
 import zipfile
+from pathlib import Path
 
 import aiohttp
 from aiohttp import web
@@ -538,3 +542,505 @@ async def post_restart(request):
     """
     asyncio.create_task(auto_setup.schedule_restart(delay=0.25))
     return web.json_response({"status": "restarting"})
+
+
+# ---------------------------------------------------------------------------
+# Local Playground: test a workflow through its Runflow Input/Output surface
+# without touching the node graph. See README "Local Playground" and
+# docs/exec-plans/active/2026-05-29-comfyui-runflow-local-playground.md.
+# ---------------------------------------------------------------------------
+
+# Process-memory caches. Lost on restart — recapturing via the Local Playground
+# button on the Deploy node refreshes them.
+_PLAYGROUND_WORKFLOWS: dict[str, dict] = {}
+_PLAYGROUND_RUNS: dict[str, dict] = {}
+
+_PLAYGROUND_DIR = Path(__file__).resolve().parent / "js" / "playground"
+_PLAYGROUND_RUN_TIMEOUT_S = 30 * 60  # 30 minutes, matches the cloud worker
+
+# Runflow Input variants — class-suffix → wire type. Keep in sync with
+# io_nodes._INPUT_TYPES.
+_RUNFLOW_INPUT_TYPES = {"String", "Int", "Float", "Boolean", "Image"}
+
+# Extension → preview kind. Buckets returned by ComfyUI's history outputs
+# already give us the kind for the common cases (images / gifs / audios /
+# videos / model_files); extensions backstop the "files" bucket where the
+# kind has to be inferred.
+_VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv"}
+_AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".opus", ".m4a"}
+_THREED_EXTS = {".glb", ".gltf", ".obj", ".ply", ".stl", ".fbx", ".usdz"}
+
+_PLAYGROUND_INDEX_TEMPLATE: str | None = None
+
+
+def _load_playground_index_template() -> str:
+    """Read js/playground/index.html once and cache it. Raise if missing — the
+    plugin install is broken if the template is gone, and the request handler
+    should surface a 500 rather than serve an empty page."""
+    global _PLAYGROUND_INDEX_TEMPLATE
+    if _PLAYGROUND_INDEX_TEMPLATE is None:
+        _PLAYGROUND_INDEX_TEMPLATE = (_PLAYGROUND_DIR / "index.html").read_text(encoding="utf-8")
+    return _PLAYGROUND_INDEX_TEMPLATE
+
+
+def _runflow_input_type(class_type: str) -> str | None:
+    """``RunflowInputString`` → ``"STRING"``. None for anything that isn't a
+    recognised Runflow Input class."""
+    if not class_type.startswith("RunflowInput"):
+        return None
+    suffix = class_type[len("RunflowInput"):]
+    return suffix.upper() if suffix in _RUNFLOW_INPUT_TYPES else None
+
+
+def _runflow_output_type(class_type: str) -> str | None:
+    """``RunflowOutputImage`` → ``"IMAGE"``. None for non-output classes."""
+    if not class_type.startswith("RunflowOutput"):
+        return None
+    return class_type[len("RunflowOutput"):].upper()
+
+
+def _is_link(value) -> bool:
+    """Prompt-JSON socket links are ``[upstream_node_id, slot_index]``."""
+    return isinstance(value, list) and len(value) == 2
+
+
+def _extract_playground_schema(workflow_json: dict) -> tuple[list[dict], list[dict]]:
+    """Walk the captured prompt JSON for ``RunflowInput*`` / ``RunflowOutput*``
+    nodes. Returns ``(inputs, outputs)``.
+
+    Each input row: ``{input_id, type, display_name, description, default_value}``.
+    Each output row: ``{output_id, type, output_name}``.
+
+    Skips nodes with empty ``input_id`` / ``output_id`` so a half-configured
+    graph still loads — the form just renders fewer fields.
+    """
+    inputs: list[dict] = []
+    outputs: list[dict] = []
+    for node in workflow_json.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type", "")
+        node_inputs = node.get("inputs") or {}
+
+        in_type = _runflow_input_type(class_type)
+        if in_type is not None:
+            input_id = str(node_inputs.get("input_id") or "").strip()
+            if not input_id:
+                continue
+            raw_default = node_inputs.get("value")
+            default_value = None if _is_link(raw_default) else raw_default
+            inputs.append({
+                "input_id": input_id,
+                "type": in_type,
+                "display_name": str(node_inputs.get("display_name") or "").strip() or input_id,
+                "description": str(node_inputs.get("description") or "").strip(),
+                "default_value": default_value,
+            })
+            continue
+
+        out_type = _runflow_output_type(class_type)
+        if out_type is not None:
+            output_id = str(node_inputs.get("output_id") or "").strip()
+            if not output_id:
+                continue
+            outputs.append({
+                "output_id": output_id,
+                "type": out_type,
+                "output_name": str(node_inputs.get("output_name") or "").strip() or output_id,
+            })
+    return inputs, outputs
+
+
+def _coerce_input_value(in_type: str, raw):
+    """Cast a form-submitted value into the type the ComfyUI socket expects.
+    Raises ``ValueError`` with a user-facing message on mismatch."""
+    if in_type == "STRING":
+        return "" if raw is None else str(raw)
+    if in_type == "INT":
+        if isinstance(raw, bool):
+            raise ValueError("expected an integer, got a boolean")
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"expected an integer, got {raw!r}") from exc
+    if in_type == "FLOAT":
+        if isinstance(raw, bool):
+            raise ValueError("expected a number, got a boolean")
+        try:
+            return float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"expected a number, got {raw!r}") from exc
+    if in_type == "BOOLEAN":
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            if raw.lower() in ("true", "1", "yes", "on"):
+                return True
+            if raw.lower() in ("false", "0", "no", "off", ""):
+                return False
+        raise ValueError(f"expected a boolean, got {raw!r}")
+    raise ValueError(f"unsupported input type: {in_type}")
+
+
+def _allocate_node_id(prompt: dict) -> str:
+    """Return a fresh string node id that doesn't collide with existing keys.
+
+    Strategy: take the max numeric existing id (ignoring non-numeric keys
+    from subgraph instances etc.), add 1. If no numeric keys exist at all,
+    start at 1000 to stay clear of the user's hand-typed range.
+    """
+    max_id = 0
+    for key in prompt:
+        if isinstance(key, str) and key.isdigit():
+            max_id = max(max_id, int(key))
+    candidate = max_id + 1 if max_id else 1000
+    while str(candidate) in prompt:
+        candidate += 1
+    return str(candidate)
+
+
+def _inject_image_input(prompt: dict, target_node: dict, filename: str) -> None:
+    """Wire a fresh ``LoadImage`` node into ``target_node.inputs.value``.
+
+    The ``RunflowInputImage`` socket is typed ``IMAGE`` — a literal filename
+    string would fail ComfyUI's type check. ``LoadImage`` reads the file from
+    ``input/`` (where ``POST /upload/image`` puts it) and emits the IMAGE
+    tensor the rest of the graph expects.
+    """
+    new_id = _allocate_node_id(prompt)
+    prompt[new_id] = {
+        "class_type": "LoadImage",
+        "inputs": {
+            "image": filename,
+            "upload": "image",
+        },
+    }
+    target_node.setdefault("inputs", {})["value"] = [new_id, 0]
+
+
+def _inject_run_values(prompt: dict, inputs_schema: list[dict], values: dict) -> list[str]:
+    """Apply form values to the prompt JSON in place. Returns the list of
+    missing required ``input_id``s — the caller turns that into a 400.
+
+    For each ``RunflowInput*`` node we look up its declared ``input_id`` and:
+    overwrite ``inputs.value`` with the form value (drops any existing link
+    by construction) for scalars, or inject a ``LoadImage`` for ``IMAGE``.
+    """
+    by_input_id: dict[str, list[tuple[str, dict, str]]] = {}
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict):
+            continue
+        in_type = _runflow_input_type(node.get("class_type", ""))
+        if in_type is None:
+            continue
+        input_id = str((node.get("inputs") or {}).get("input_id") or "").strip()
+        if not input_id:
+            continue
+        by_input_id.setdefault(input_id, []).append((node_id, node, in_type))
+
+    missing: list[str] = []
+    for schema in inputs_schema:
+        input_id = schema["input_id"]
+        in_type = schema["type"]
+        if input_id not in values or values[input_id] in (None, ""):
+            # IMAGE without a file is missing; for the other types the empty
+            # string is still a legitimate-if-odd value, but we reject it for
+            # consistency with the form's required-field rule.
+            missing.append(input_id)
+            continue
+        for _node_id, node, node_type in by_input_id.get(input_id, []):
+            if node_type == "IMAGE":
+                _inject_image_input(prompt, node, str(values[input_id]))
+            else:
+                node.setdefault("inputs", {})["value"] = _coerce_input_value(node_type, values[input_id])
+    return missing
+
+
+def _classify_output_kind(bucket: str, filename: str) -> str:
+    """Map a (history bucket, filename) pair to a preview kind."""
+    if bucket == "images" or bucket == "gifs":
+        return "image"
+    if bucket == "videos":
+        return "video"
+    if bucket == "audios":
+        return "audio"
+    if bucket == "model_files":
+        return "3d"
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _AUDIO_EXTS:
+        return "audio"
+    if ext in _THREED_EXTS:
+        return "3d"
+    return "file"
+
+
+def _build_view_url(entry: dict) -> str:
+    """Build a relative ``/view`` URL for an output entry. Relative so the
+    page works regardless of which host/port the user opened it on."""
+    params = urllib.parse.urlencode({
+        "filename": str(entry.get("filename") or ""),
+        "subfolder": str(entry.get("subfolder") or ""),
+        "type": str(entry.get("type") or "output"),
+    })
+    return f"/view?{params}"
+
+
+def _build_outputs_from_history(
+    workflow_json: dict,
+    outputs_schema: list[dict],
+    history_outputs: dict,
+) -> dict:
+    """Walk every cached output node, look up its history entry, and produce
+    ``{output_id: [{kind, url, filename}, ...]}``. Missing entries become
+    empty lists so the frontend can still render an "empty output" pill.
+    """
+    output_id_by_node_id: dict[str, str] = {}
+    for node_id, node in workflow_json.items():
+        if not isinstance(node, dict):
+            continue
+        if _runflow_output_type(node.get("class_type", "")) is None:
+            continue
+        output_id = str((node.get("inputs") or {}).get("output_id") or "").strip()
+        if output_id:
+            output_id_by_node_id[node_id] = output_id
+
+    by_output: dict[str, list[dict]] = {o["output_id"]: [] for o in outputs_schema}
+    for node_id, node_output in history_outputs.items():
+        output_id = output_id_by_node_id.get(node_id)
+        if output_id is None or not isinstance(node_output, dict):
+            continue
+        for bucket, entries in node_output.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                filename = str(entry.get("filename") or "")
+                if not filename:
+                    continue
+                by_output.setdefault(output_id, []).append({
+                    "kind": _classify_output_kind(bucket, filename),
+                    "url": _build_view_url(entry),
+                    "filename": filename,
+                })
+    return by_output
+
+
+async def _drive_playground_run(run_id: str, slug: str, prompt: dict, client_id: str) -> None:
+    """Run the modified prompt against the local ComfyUI: open WS → POST
+    /prompt → drain until completion → GET /history → store parsed outputs.
+
+    Mirrors ``bg-brain/workers/comfyui-deploy-worker/comfyui_runner.py``'s
+    proven loop, scaled down to a single in-process call.
+    """
+    try:
+        _, port, _ = _detect_listen()
+        base = f"http://127.0.0.1:{port}"
+        ws_uri = f"ws://127.0.0.1:{port}/ws?clientId={client_id}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(ws_uri) as ws:
+                async with session.post(
+                    f"{base}/prompt",
+                    json={"prompt": prompt, "client_id": client_id},
+                ) as resp:
+                    if resp.status != 200:
+                        body = (await resp.text())[:500]
+                        raise RuntimeError(f"ComfyUI rejected prompt ({resp.status}): {body}")
+                    payload = await resp.json()
+                    prompt_id = payload.get("prompt_id")
+                    if not isinstance(prompt_id, str):
+                        raise RuntimeError(f"ComfyUI /prompt response missing prompt_id: {payload!r}")
+
+                await _drain_until_complete(ws, prompt_id)
+
+            async with session.get(f"{base}/history/{prompt_id}") as resp:
+                resp.raise_for_status()
+                history = await resp.json()
+
+        entry = (history or {}).get(prompt_id, {})
+        status = entry.get("status") or {}
+        if isinstance(status, dict) and status.get("status_str") == "error":
+            message = _summarize_execution_error(status.get("messages") or [])
+            raise RuntimeError(f"workflow errored: {message}")
+
+        cached = _PLAYGROUND_WORKFLOWS.get(slug) or {}
+        workflow_json = cached.get("workflow_json") or {}
+        outputs_schema = cached.get("outputs") or []
+        outputs = _build_outputs_from_history(workflow_json, outputs_schema, entry.get("outputs") or {})
+
+        _PLAYGROUND_RUNS[run_id] = {
+            "status": "succeeded",
+            "slug": slug,
+            "prompt_id": prompt_id,
+            "outputs": outputs,
+        }
+    except asyncio.CancelledError:
+        _PLAYGROUND_RUNS[run_id] = {"status": "failed", "slug": slug, "error": "cancelled"}
+        raise
+    except Exception as exc:
+        logger.exception("Runflow playground run %s failed", run_id)
+        _PLAYGROUND_RUNS[run_id] = {"status": "failed", "slug": slug, "error": str(exc)}
+
+
+async def _drain_until_complete(ws, prompt_id: str) -> None:
+    """Drain ``ws`` until ComfyUI emits ``executing`` with ``data.node == null``
+    for our ``prompt_id``. Times out after ``_PLAYGROUND_RUN_TIMEOUT_S``."""
+    deadline = time.monotonic() + _PLAYGROUND_RUN_TIMEOUT_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"workflow did not complete within {_PLAYGROUND_RUN_TIMEOUT_S}s")
+        try:
+            msg = await asyncio.wait_for(ws.receive(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"workflow did not complete within {_PLAYGROUND_RUN_TIMEOUT_S}s") from exc
+        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+            raise RuntimeError("ComfyUI WebSocket closed before workflow completion event")
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            raise RuntimeError(f"ComfyUI WebSocket error: {ws.exception()!r}")
+        if msg.type != aiohttp.WSMsgType.TEXT:
+            continue
+        try:
+            data = json.loads(msg.data)
+        except (TypeError, ValueError):
+            continue
+        if (
+            data.get("type") == "executing"
+            and (data.get("data") or {}).get("node") is None
+            and (data.get("data") or {}).get("prompt_id") == prompt_id
+        ):
+            return
+
+
+def _summarize_execution_error(messages: list) -> str:
+    """Pluck the first ``execution_error`` / ``execution_interrupted`` payload
+    out of ComfyUI's ``status.messages`` list."""
+    for msg in messages:
+        if not isinstance(msg, list) or len(msg) < 2:
+            continue
+        msg_type, payload = msg[0], msg[1]
+        if msg_type in ("execution_error", "execution_interrupted") and isinstance(payload, dict):
+            node_type = payload.get("node_type", "?")
+            exception_message = payload.get("exception_message") or payload.get("error", "")
+            return f"{msg_type} in {node_type}: {str(exception_message)[:300]}"
+    return "unknown error (no execution_error message in ComfyUI status)"
+
+
+@PromptServer.instance.routes.post("/runflow/playground/workflows/{slug}")
+async def post_playground_workflow(request):
+    """Cache a captured workflow + extracted schema, keyed by slug."""
+    slug = request.match_info["slug"]
+    body = await request.json()
+    workflow_json = body.get("workflow_json")
+    if not isinstance(workflow_json, dict) or not workflow_json:
+        return web.json_response({"error": "workflow_json is required"}, status=400)
+    inputs, outputs = _extract_playground_schema(workflow_json)
+    _PLAYGROUND_WORKFLOWS[slug] = {
+        "endpoint_name": str(body.get("endpoint_name") or slug),
+        "captured_at": time.time(),
+        "workflow_json": workflow_json,
+        "inputs": inputs,
+        "outputs": outputs,
+    }
+    return web.json_response({
+        "ok": True,
+        "slug": slug,
+        "input_count": len(inputs),
+        "output_count": len(outputs),
+    })
+
+
+@PromptServer.instance.routes.get("/runflow/playground/{slug}")
+async def get_playground_page(request):
+    """Serve the playground HTML shell with bootstrap JSON injected."""
+    slug = request.match_info["slug"]
+    cached = _PLAYGROUND_WORKFLOWS.get(slug)
+    if cached is None:
+        return web.Response(
+            status=404,
+            text=(
+                "Runflow Playground: no workflow cached for this slug. "
+                "Open ComfyUI, click 'Local Playground' on the Runflow Deploy node, "
+                "then reload."
+            ),
+            content_type="text/plain",
+        )
+    bootstrap = {
+        "slug": slug,
+        "endpoint_name": cached["endpoint_name"],
+        "captured_at": cached["captured_at"],
+        "inputs": cached["inputs"],
+        "outputs": cached["outputs"],
+    }
+    try:
+        template = _load_playground_index_template()
+    except OSError as exc:
+        logger.exception("Runflow playground: failed to read index.html")
+        return web.Response(status=500, text=f"playground template missing: {exc}", content_type="text/plain")
+    # Escape `</` so a user-supplied string (e.g. an input description containing
+    # ``</script>``) can't break out of the embedded JSON script tag.
+    safe_json = json.dumps(bootstrap).replace("</", "<\\/")
+    html = template.replace("{{BOOTSTRAP_JSON}}", safe_json)
+    return web.Response(text=html, content_type="text/html")
+
+
+@PromptServer.instance.routes.get("/runflow/playground/_static/{filename}")
+async def get_playground_static(request):
+    """Serve playground.css / playground.js from js/playground/. The filename
+    is hard-restricted to a basename allowlist so this can't be coaxed into a
+    path-traversal — we never construct a path from arbitrary input.
+    """
+    filename = request.match_info["filename"]
+    if filename not in {"playground.css", "playground.js"}:
+        return web.Response(status=404, text="not found", content_type="text/plain")
+    path = _PLAYGROUND_DIR / filename
+    if not path.is_file():
+        return web.Response(status=404, text="not found", content_type="text/plain")
+    return web.FileResponse(path)
+
+
+@PromptServer.instance.routes.post("/runflow/playground/{slug}/run")
+async def post_playground_run(request):
+    """Start a playground run. Returns ``{run_id}`` immediately; the
+    background task drains the WS and stores the result in ``_PLAYGROUND_RUNS``.
+    """
+    slug = request.match_info["slug"]
+    cached = _PLAYGROUND_WORKFLOWS.get(slug)
+    if cached is None:
+        return web.json_response({"error": "workflow not cached; reopen Local Playground"}, status=404)
+    body = await request.json()
+    values = body.get("values") or {}
+    if not isinstance(values, dict):
+        return web.json_response({"error": "values must be an object"}, status=400)
+
+    prompt = copy.deepcopy(cached["workflow_json"])
+    try:
+        missing = _inject_run_values(prompt, cached["inputs"], values)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    if missing:
+        return web.json_response(
+            {"error": f"missing required inputs: {', '.join(missing)}", "missing": missing},
+            status=400,
+        )
+
+    run_id = uuid.uuid4().hex
+    client_id = uuid.uuid4().hex
+    _PLAYGROUND_RUNS[run_id] = {"status": "running", "slug": slug}
+    asyncio.create_task(_drive_playground_run(run_id, slug, prompt, client_id))
+    return web.json_response({"run_id": run_id})
+
+
+@PromptServer.instance.routes.get("/runflow/playground/{slug}/runs/{run_id}")
+async def get_playground_run(request):
+    """Poll a playground run by id."""
+    run_id = request.match_info["run_id"]
+    record = _PLAYGROUND_RUNS.get(run_id)
+    if record is None:
+        return web.json_response({"error": "run not found"}, status=404)
+    if record.get("slug") != request.match_info["slug"]:
+        return web.json_response({"error": "run not found"}, status=404)
+    return web.json_response(record)

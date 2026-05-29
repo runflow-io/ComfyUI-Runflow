@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Runflow Playground</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/runflow/playground/_static/playground.css" />
+</head>
+<body>
+<div class="page">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-word">Run<span class="brand-word-accent">flow</span></span>
+      <span class="brand-divider"></span>
+      <span class="brand-label">Local Playground</span>
+    </div>
+    <div class="topbar-meta">
+      <span id="endpoint-pill" class="endpoint-pill">…</span>
+      <span id="captured-at" class="captured-at"></span>
+    </div>
+  </header>
+
+  <main class="grid" id="playground-root">
+    <section class="card panel-input" aria-labelledby="input-heading">
+      <div class="panel-head">
+        <h2 id="input-heading">Input</h2>
+        <span class="eyebrow" id="input-count"></span>
+      </div>
+      <form id="input-form" class="form" autocomplete="off" novalidate></form>
+      <div class="actions">
+        <button type="button" class="btn-ghost" id="reset-btn">Reset</button>
+        <button type="button" class="btn-primary" id="run-btn">Run</button>
+      </div>
+      <p id="form-error" class="form-error" role="alert" hidden></p>
+    </section>
+
+    <section class="card panel-output" aria-labelledby="output-heading">
+      <div class="panel-head">
+        <h2 id="output-heading">Output</h2>
+        <span class="eyebrow" id="output-count"></span>
+      </div>
+      <div id="output-area" class="output-area">
+        <div class="output-idle">
+          <div class="output-idle-icon" aria-hidden="true"></div>
+          <p>No output yet. Fill the form and click Run.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span class="mono">runflow / comfyui plugin</span>
+    <span class="mono dim">workflow lives in memory · reopen to refresh</span>
+  </footer>
+</div>
+
+<script type="application/json" id="rf-playground-bootstrap">{{BOOTSTRAP_JSON}}</script>
+<script type="module" src="/runflow/playground/_static/playground.js"></script>
+</body>
+</html>
