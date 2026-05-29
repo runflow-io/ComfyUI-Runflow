@@ -430,6 +430,51 @@ async function openLocalPlayground(node) {
     }
 }
 
+// Upload a local file into ComfyUI's input/ dir and return its stored name.
+async function uploadInputFile(file) {
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    const resp = await fetch("/runflow/upload-input-file", { method: "POST", body: fd });
+    if (!resp.ok) {
+        const detail = await resp.text().catch(() => `HTTP ${resp.status}`);
+        throw new Error(`upload failed: ${detail || resp.status}`);
+    }
+    return resp.json();
+}
+
+app.registerExtension({
+    name: "Runflow.InputFile",
+    async nodeCreated(node) {
+        if (node.comfyClass !== "RunflowInputFile") return;
+        const fileNameWidget = node.widgets?.find(w => w.name === "file_name");
+        if (!fileNameWidget) return;
+
+        const button = node.addWidget("button", "📁 Choose file", null, () => {
+            const picker = document.createElement("input");
+            picker.type = "file";
+            picker.style.display = "none";
+            picker.addEventListener("change", async () => {
+                const picked = picker.files && picker.files[0];
+                picker.remove();
+                if (!picked) return;
+                button.name = "Uploading…";
+                node.setDirtyCanvas(true, true);
+                try {
+                    const uploaded = await uploadInputFile(picked);
+                    fileNameWidget.value = uploaded.name;
+                    button.name = "📁 Choose file";
+                } catch (err) {
+                    console.error("[Runflow] file upload failed", err);
+                    button.name = "📁 Choose file (upload failed)";
+                }
+                node.setDirtyCanvas(true, true);
+            });
+            document.body.appendChild(picker);
+            picker.click();
+        });
+    },
+});
+
 app.registerExtension({
     name: "Runflow.Deploy",
     async beforeRegisterNodeDef(nodeType, nodeData) {

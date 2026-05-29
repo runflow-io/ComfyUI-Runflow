@@ -397,6 +397,46 @@ async def upload_workflow_resources(request):
     return web.json_response({"resources": resources})
 
 
+@PromptServer.instance.routes.post("/runflow/upload-input-file")
+async def upload_input_file(request):
+    """Save an uploaded file into ComfyUI's input/ directory and return its
+    name. Backs the ``Runflow Input (File)`` node's upload button and the local
+    playground's file control — a generic alternative to ``/upload/image`` that
+    accepts any file type.
+
+    Request: ``multipart/form-data`` with a single ``file`` field.
+    Response: ``{"name": "<filename>"}``.
+    """
+    reader = await request.multipart()
+    field = await reader.next()
+    while field is not None and field.name != "file":
+        field = await reader.next()
+    if field is None:
+        return web.json_response({"error": "missing 'file' field"}, status=400)
+
+    # Strip any directory components (and Windows separators, which
+    # os.path.basename leaves untouched on POSIX) so the upload can't escape
+    # the input directory.
+    filename = os.path.basename((field.filename or "").replace("\\", "/"))
+    if not filename:
+        return web.json_response({"error": "missing filename"}, status=400)
+
+    input_dir = folder_paths.get_input_directory()
+    os.makedirs(input_dir, exist_ok=True)
+    dest = os.path.join(input_dir, filename)
+    if os.path.realpath(os.path.dirname(dest)) != os.path.realpath(input_dir):
+        return web.json_response({"error": "invalid filename"}, status=400)
+
+    with open(dest, "wb") as f:
+        while True:
+            chunk = await field.read_chunk()
+            if not chunk:
+                break
+            f.write(chunk)
+
+    return web.json_response({"name": filename})
+
+
 @PromptServer.instance.routes.post("/runflow/resolve-models")
 async def post_resolve_models(request):
     """Resolve every model the workflow uses and hash the local files.
@@ -559,8 +599,8 @@ _PLAYGROUND_DIR = Path(__file__).resolve().parent / "js" / "playground"
 _PLAYGROUND_RUN_TIMEOUT_S = 30 * 60  # 30 minutes, matches the cloud worker
 
 # Runflow Input variants — class-suffix → wire type. Keep in sync with
-# io_nodes._INPUT_TYPES.
-_RUNFLOW_INPUT_TYPES = {"String", "Int", "Float", "Boolean", "Image"}
+# io_nodes._INPUT_TYPES (plus the standalone RunflowInputFile).
+_RUNFLOW_INPUT_TYPES = {"String", "Int", "Float", "Boolean", "Image", "File"}
 
 # Extension → preview kind. Buckets returned by ComfyUI's history outputs
 # already give us the kind for the common cases (images / gifs / audios /
@@ -627,7 +667,9 @@ def _extract_playground_schema(workflow_json: dict) -> tuple[list[dict], list[di
             input_id = str(node_inputs.get("input_id") or "").strip()
             if not input_id:
                 continue
-            raw_default = node_inputs.get("value")
+            # FILE carries its local default in the `file_name` widget rather
+            # than the `value` socket (which is the run-time injection point).
+            raw_default = node_inputs.get("file_name") if in_type == "FILE" else node_inputs.get("value")
             default_value = None if _is_link(raw_default) else raw_default
             inputs.append({
                 "input_id": input_id,
@@ -654,7 +696,8 @@ def _extract_playground_schema(workflow_json: dict) -> tuple[list[dict], list[di
 def _coerce_input_value(in_type: str, raw):
     """Cast a form-submitted value into the type the ComfyUI socket expects.
     Raises ``ValueError`` with a user-facing message on mismatch."""
-    if in_type == "STRING":
+    if in_type in ("STRING", "FILE"):
+        # FILE is a filename string in the graph; the upload widget supplies it.
         return "" if raw is None else str(raw)
     if in_type == "INT":
         if isinstance(raw, bool):

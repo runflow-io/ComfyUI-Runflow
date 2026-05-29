@@ -120,6 +120,7 @@ function buildControl(input) {
         case "FLOAT":   return buildNumberControl(input, /* step */ "any");
         case "BOOLEAN": return buildBooleanControl(input);
         case "IMAGE":   return buildImageControl(input);
+        case "FILE":    return buildFileControl(input);
         default: {
             const note = document.createElement("p");
             note.className = "field-description";
@@ -248,6 +249,72 @@ async function uploadImage(file) {
     fd.append("image", file, file.name);
     fd.append("type", "input");
     const resp = await fetch("/upload/image", { method: "POST", body: fd });
+    if (!resp.ok) {
+        const detail = await resp.text().catch(() => `HTTP ${resp.status}`);
+        throw new Error(`upload failed: ${detail || resp.status}`);
+    }
+    return resp.json();
+}
+
+function buildFileControl(input) {
+    // Like the image control, but accepts any file type and uploads through
+    // the Runflow generic endpoint (writes to ComfyUI/input/). The workflow
+    // receives the uploaded filename as a plain string.
+    const wrap = document.createElement("div");
+    wrap.className = "file-row";
+    const id = controlId(input.input_id);
+    const file = document.createElement("input");
+    file.type = "file";
+    file.id = id;
+    const trigger = document.createElement("label");
+    trigger.className = "file-trigger";
+    trigger.setAttribute("for", id);
+    trigger.textContent = "Choose file";
+    const nameEl = document.createElement("span");
+    nameEl.className = "file-name";
+    const progress = document.createElement("span");
+    progress.className = "file-progress";
+
+    // Pre-fill from the node's file_name widget default, if any.
+    if (input.default_value) {
+        nameEl.textContent = String(input.default_value);
+        state.values[input.input_id] = String(input.default_value);
+    } else {
+        nameEl.textContent = "No file selected";
+    }
+
+    file.addEventListener("change", async () => {
+        const picked = file.files && file.files[0];
+        if (!picked) return;
+        nameEl.textContent = picked.name;
+        progress.textContent = "Uploading…";
+        state.pendingUploads += 1;
+        refreshRunButton();
+        try {
+            const uploaded = await uploadFile(picked);
+            state.values[input.input_id] = uploaded.name;
+            progress.textContent = "✓";
+        } catch (err) {
+            console.error(err);
+            progress.textContent = "upload failed";
+            state.values[input.input_id] = undefined;
+        } finally {
+            state.pendingUploads -= 1;
+            refreshRunButton();
+        }
+    });
+
+    wrap.appendChild(file);
+    wrap.appendChild(trigger);
+    wrap.appendChild(nameEl);
+    wrap.appendChild(progress);
+    return wrap;
+}
+
+async function uploadFile(file) {
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    const resp = await fetch("/runflow/upload-input-file", { method: "POST", body: fd });
     if (!resp.ok) {
         const detail = await resp.text().catch(() => `HTTP ${resp.status}`);
         throw new Error(`upload failed: ${detail || resp.status}`);
