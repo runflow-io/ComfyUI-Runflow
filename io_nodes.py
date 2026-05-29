@@ -5,11 +5,17 @@ The deploy-time rewriter (future work in the inference service) consumes
 the class attrs below to inject caller-supplied values without executing
 Python here.
 
-Inputs cover STRING / INT / FLOAT / BOOLEAN / IMAGE. Outputs cover IMAGE
+Inputs cover STRING / INT / FLOAT / BOOLEAN / IMAGE / FILE. Outputs cover IMAGE
 (saves each batch image as PNG) and FILE (announces an arbitrary file
 already sitting under ComfyUI's output directory — videos, 3D meshes,
 audio, archives). MASK / LATENT and the Seed input variant remain off
 the surface pending end-to-end deploy support.
+
+FILE is the one input that is not a pure socket pass-through: locally it
+emits the `file_name` widget (a file the developer uploaded into ComfyUI's
+input/ dir) as a STRING, so the graph treats it as a plain filename. On the
+Runflow site `RUNFLOW_TYPE="FILE"` makes it render as a file upload, and the
+rewriter injects the caller's file reference into the `value` socket.
 
 Both output node kinds emit `{"ui": {...}, "result": (value,)}` so each
 artifact lands in `/history/{prompt_id}.outputs` keyed by the output
@@ -175,9 +181,44 @@ class RunflowOutputFile:
         return {"ui": {"files": [entry]}, "result": (value,)}
 
 
+class RunflowInputFile:
+    """Runflow file input. Acts as a STRING (a filename) inside the graph, but
+    renders as a file upload on the Runflow site.
+
+    Locally the node outputs the `file_name` widget — a file the developer
+    uploaded into ComfyUI's input/ dir via the node's "Choose file" button —
+    so any downstream loader that takes a filename can consume it. At deploy /
+    run time the rewriter injects the caller-supplied file reference into the
+    `value` socket, which then takes precedence over `file_name`."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input_id": ("STRING", {"default": "file_input"}),
+                "display_name": ("STRING", {"default": ""}),
+                "description": ("STRING", {"default": "", "multiline": True}),
+                "file_name": ("STRING", {"default": ""}),
+            },
+            "optional": {"value": ("STRING", {"forceInput": True})},
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("value",)
+    FUNCTION = "resolve"
+    CATEGORY = "Runflow/Input"
+
+    RUNFLOW_IO = "input"
+    RUNFLOW_TYPE = "FILE"
+
+    def resolve(self, input_id, display_name, description, file_name, value=None):
+        return (value if value not in (None, "") else file_name,)
+
+
 RUNFLOW_INPUT_CLASSES: dict[str, type] = {
     f"RunflowInput{t.capitalize()}": _make_input_class(t) for t in _INPUT_TYPES
 }
+RUNFLOW_INPUT_CLASSES["RunflowInputFile"] = RunflowInputFile
 
 RUNFLOW_OUTPUT_CLASSES: dict[str, type] = {
     "RunflowOutputImage": RunflowOutputImage,

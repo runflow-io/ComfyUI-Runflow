@@ -102,7 +102,7 @@ The **Local Playground** button (directly below Deploy on the Runflow Deploy nod
 
 **Open it:** click **Local Playground** on the Deploy node. A new tab opens at `http://<comfy-host>/runflow/playground/<slug>`, where `<slug>` is derived from `endpoint_name` the same way Deploy derives it (`Background Removal v2.1` → `background-removal-v21`).
 
-**Form:** generated from the workflow's `Runflow Input (…)` nodes. The `display_name` widget is the field label, the `description` widget is the helper text, and the input type comes from the node class. Booleans render as a switch; numbers as a number input; images as a file picker that uploads through ComfyUI's built-in `/upload/image` (the file lands in `ComfyUI/input/`, and the uploaded filename is what the workflow receives).
+**Form:** generated from the workflow's `Runflow Input (…)` nodes. The `display_name` widget is the field label, the `description` widget is the helper text, and the input type comes from the node class. Booleans render as a switch; numbers as a number input; images as a file picker that uploads through ComfyUI's built-in `/upload/image` (the file lands in `ComfyUI/input/`, and the uploaded filename is what the workflow receives); files as a file picker that uploads through Runflow's `/runflow/upload-input-file` (same `ComfyUI/input/` destination, any file type).
 
 **Run:** click **Run**. The plugin takes a copy of the captured workflow, **disconnects** the `value` link on every `Runflow Input` node — exactly the same scrubbing rule Deploy uses to detach the local test wiring — and **replaces it with the form value** (or, for image inputs, a freshly-injected `LoadImage` node pointed at the uploaded file). The graph then runs against the local ComfyUI via `/prompt`, drains `/ws` until completion, and pulls outputs from `/history`.
 
@@ -139,8 +139,11 @@ Place a typed `Runflow Input (…)` node for each value your endpoint accepts an
 | `Runflow Input (Float)` | `RunflowInputFloat` | `float_input` |
 | `Runflow Input (Boolean)` | `RunflowInputBoolean` | `boolean_input` |
 | `Runflow Input (Image)` | `RunflowInputImage` | `image_input` |
+| `Runflow Input (File)` | `RunflowInputFile` | `file_input` |
 
 Locally each input is a pass-through; at deploy time the rewriter injects caller-supplied values. Use the `display_name` and `description` widgets to label the field in the Runflow playground.
+
+`Runflow Input (File)` behaves as a plain **string** (a filename) inside the graph, so any loader that takes a file path can consume it. Use its **📁 Choose file** button to upload a local file into `ComfyUI/input/` — the chosen `file_name` becomes the node's output locally and the deploy default. On the Runflow site the field renders as a **file upload**.
 
 ### Output nodes
 
