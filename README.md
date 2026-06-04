@@ -175,13 +175,13 @@ These nodes require a recent ComfyUI (`comfy_api.latest` module). On older insta
 Once deployed, the workflow is available as an HTTP endpoint:
 
 ```
-POST https://api.runflow.io/v1/models/{org}/{endpoint}/runs
+POST https://api.runflow.io/v1/comfyui-workflows/{owner}/{slug}/runs
 ```
 
 ### Example
 
 ```bash
-curl -X POST https://api.runflow.io/v1/models/your-org/your-endpoint/runs \
+curl -X POST https://api.runflow.io/v1/comfyui-workflows/your-org/your-endpoint/runs \
   -H "Authorization: Bearer $RUNFLOW_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -201,7 +201,15 @@ curl -X POST https://api.runflow.io/v1/models/your-org/your-endpoint/runs \
   "id": "01J0...",
   "status_code": "succeeded",
   "output": {
-    "image": ["https://..."]
+    "kind": "comfyui_outputs",
+    "outputs": [
+      {
+        "output_id": "image",
+        "url": "https://...",
+        "content_type": "image/png",
+        "size_bytes": 1048576
+      }
+    ]
   }
 }
 ```
@@ -214,15 +222,7 @@ Output URLs are presigned and time-limited — download or rehost immediately. S
 
 Runs are billed per second of GPU time. By default the platform picks the cheapest GPU that fits the workflow's memory requirements; you can pin a specific model via `PATCH /v1/comfyui-workflows/{id}`.
 
-| GPU | Memory | Per-second rate | Use case |
-|---|---|---|---|
-| L4 | 24 GB | $0.000147/s | SDXL, light workflows |
-| A10G | 24 GB | $0.000222/s | Mid-range SDXL, small video |
-| L40S | 48 GB | $0.000444/s | Flux, Wan, large image models |
-| A100 | 80 GB | $0.000917/s | Heavy video, large-memory models |
-| H100 | 80 GB | $0.00125/s | High-throughput video production |
-
-See [runflow.io/pricing](https://www.runflow.io/pricing) for current rates. Workers scale to zero when idle, so the next run after a quiet period pays a 10–40s cold-start. For latency-sensitive workloads, schedule warming runs or keep a playground tab open.
+The available GPU types and their per-second rates are listed at [runflow.io/pricing](https://www.runflow.io/pricing) — check there before sizing a budget. Workers scale to zero when idle, so the next run after a quiet period pays a 10–40s cold-start. For latency-sensitive workloads, schedule warming runs or keep a playground tab open.
 
 ---
 
