@@ -54,11 +54,12 @@ def _make_input_class(type_name: str) -> type:
                 "input_id": ("STRING", {"default": f"{type_name.lower()}_input"}),
                 "display_name": ("STRING", {"default": ""}),
                 "description": ("STRING", {"default": "", "multiline": True}),
+                "required": ("BOOLEAN", {"default": True}),
             },
             "optional": {"value": (type_name,)},
         }
 
-    def passthrough(self, input_id, display_name, description, value=None):
+    def passthrough(self, input_id, display_name, description, required=True, value=None):
         return (value,)
 
     return type(
@@ -198,6 +199,7 @@ class RunflowInputFile:
                 "input_id": ("STRING", {"default": "file_input"}),
                 "display_name": ("STRING", {"default": ""}),
                 "description": ("STRING", {"default": "", "multiline": True}),
+                "required": ("BOOLEAN", {"default": True}),
                 "file_name": ("STRING", {"default": ""}),
             },
             "optional": {"value": ("STRING", {"forceInput": True})},
@@ -211,7 +213,7 @@ class RunflowInputFile:
     RUNFLOW_IO = "input"
     RUNFLOW_TYPE = "FILE"
 
-    def resolve(self, input_id, display_name, description, file_name, value=None):
+    def resolve(self, input_id, display_name, description, required, file_name, value=None):
         return (value if value not in (None, "") else file_name,)
 
 
