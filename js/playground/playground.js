@@ -92,6 +92,20 @@ function buildField(input) {
     label.className = "field-label";
     label.setAttribute("for", controlId(input.input_id));
     label.textContent = input.display_name;
+    // `required` defaults to true when the bootstrap omits it (older captures).
+    const required = input.required !== false;
+    if (required) {
+        const star = document.createElement("span");
+        star.className = "field-required";
+        star.textContent = "*";
+        star.title = "Required";
+        label.appendChild(star);
+    } else {
+        const optional = document.createElement("span");
+        optional.className = "field-optional";
+        optional.textContent = "optional";
+        label.appendChild(optional);
+    }
     const typeTag = document.createElement("span");
     typeTag.className = "field-type";
     typeTag.textContent = input.type.toLowerCase();
@@ -353,6 +367,7 @@ async function onRun() {
         return;
     }
     const missing = (bootstrap.inputs || [])
+        .filter((i) => i.required !== false)
         .filter((i) => state.values[i.input_id] === undefined || state.values[i.input_id] === "")
         .map((i) => i.display_name);
     if (missing.length > 0) {

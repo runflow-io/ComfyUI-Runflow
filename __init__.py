@@ -648,7 +648,7 @@ def _extract_playground_schema(workflow_json: dict) -> tuple[list[dict], list[di
     """Walk the captured prompt JSON for ``RunflowInput*`` / ``RunflowOutput*``
     nodes. Returns ``(inputs, outputs)``.
 
-    Each input row: ``{input_id, type, display_name, description, default_value}``.
+    Each input row: ``{input_id, type, display_name, description, required, default_value}``.
     Each output row: ``{output_id, type, output_name}``.
 
     Skips nodes with empty ``input_id`` / ``output_id`` so a half-configured
@@ -671,11 +671,16 @@ def _extract_playground_schema(workflow_json: dict) -> tuple[list[dict], list[di
             # than the `value` socket (which is the run-time injection point).
             raw_default = node_inputs.get("file_name") if in_type == "FILE" else node_inputs.get("value")
             default_value = None if _is_link(raw_default) else raw_default
+            # ``required`` defaults to True so graphs captured before the widget
+            # existed (and any half-configured node) keep the prior all-required
+            # behavior. Only an explicit ``False`` makes a field optional.
+            required = node_inputs.get("required")
             inputs.append({
                 "input_id": input_id,
                 "type": in_type,
                 "display_name": str(node_inputs.get("display_name") or "").strip() or input_id,
                 "description": str(node_inputs.get("description") or "").strip(),
+                "required": required if isinstance(required, bool) else True,
                 "default_value": default_value,
             })
             continue
@@ -788,8 +793,11 @@ def _inject_run_values(prompt: dict, inputs_schema: list[dict], values: dict) ->
         if input_id not in values or values[input_id] in (None, ""):
             # IMAGE without a file is missing; for the other types the empty
             # string is still a legitimate-if-odd value, but we reject it for
-            # consistency with the form's required-field rule.
-            missing.append(input_id)
+            # consistency with the form's required-field rule. Optional inputs
+            # (``required`` is False) are simply left unset so the workflow's
+            # own node default applies.
+            if schema.get("required", True):
+                missing.append(input_id)
             continue
         for _node_id, node, node_type in by_input_id.get(input_id, []):
             if node_type == "IMAGE":
