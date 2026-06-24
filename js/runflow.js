@@ -183,7 +183,13 @@ async function deployWorkflow(node) {
 
     try {
         const graphPrompt = await app.graphToPrompt();
-        const sysInfoResp = await fetch("/runflow/system-info");
+        // Send the graph so the server filters custom_nodes down to the ones
+        // this workflow actually uses.
+        const sysInfoResp = await fetch("/runflow/system-info", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ graph: graphPrompt.workflow }),
+        });
         if (!sysInfoResp.ok) {
             throw new Error(`/runflow/system-info returned ${sysInfoResp.status}`);
         }

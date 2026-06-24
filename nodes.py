@@ -265,6 +265,48 @@ def _iter_all_nodes(graph: dict):
             yield from _walk(sub.get("nodes") or [])
 
 
+def workflow_custom_node_dirs(graph: dict) -> set[str] | None:
+    """Return the set of ``custom_nodes/`` directory names whose node classes
+    appear in ``graph``, or ``None`` when the mapping can't be determined.
+
+    ComfyUI stamps every custom-node class with
+    ``RELATIVE_PYTHON_MODULE == "custom_nodes.<dir_name>"`` at load time, where
+    ``<dir_name>`` is the on-disk directory under ``custom_nodes/`` — the same
+    key :meth:`RunflowDeploy.get_custom_nodes` returns. Built-in core classes
+    carry no such attribute, so they contribute nothing and drop out naturally.
+
+    The return value distinguishes two cases callers must treat differently:
+
+    * ``None`` — ComfyUI's ``NODE_CLASS_MAPPINGS`` couldn't be imported, so we
+      have no idea which nodes are custom. Callers should NOT filter (returning
+      every installed node is safer than returning none and breaking a deploy).
+    * a ``set`` (possibly empty) — the mapping was read successfully; an empty
+      set genuinely means the workflow uses no installed custom nodes.
+    """
+    try:
+        import nodes as comfy_nodes  # ComfyUI's own top-level module
+    except Exception:
+        return None
+    mappings = getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", None)
+    if not mappings:
+        return None
+    used: set[str] = set()
+    for node in _iter_all_nodes(graph or {}):
+        class_type = node.get("type")
+        if not isinstance(class_type, str):
+            continue
+        node_cls = mappings.get(class_type)
+        if node_cls is None:
+            continue
+        rel = getattr(node_cls, "RELATIVE_PYTHON_MODULE", None)
+        if not isinstance(rel, str):
+            continue
+        parts = rel.split(".")
+        if len(parts) >= 2 and parts[0] == "custom_nodes":
+            used.add(parts[1])
+    return used
+
+
 def resolve_workflow_models(graph: dict) -> dict:
     """Return ``{"<models-relative-path>": {url?, sha256?}}`` for every model
     the workflow uses.
@@ -540,14 +582,26 @@ class RunflowDeploy:
         return files
 
     @staticmethod
-    def get_custom_nodes():
-        """Return a dict keyed by directory name with ``{origin, commit, dirty}``."""
+    def get_custom_nodes(used_dirs: set[str] | None = None):
+        """Return a dict keyed by directory name with ``{origin, commit, dirty}``.
+
+        When ``used_dirs`` is provided, only custom nodes whose directory name
+        is in that set are returned — i.e. the nodes the current workflow
+        actually uses (see :func:`workflow_custom_node_dirs`). ``None`` means
+        "don't filter" and returns every installed node.
+
+        Custom nodes without a git origin are always dropped: the deploy worker
+        clones each node from its origin, so an origin-less node (a hand-copied
+        directory, a non-git checkout) can't be reconstructed remotely and would
+        otherwise break downstream origin handling (e.g. the comfy-env hoist).
+        """
         custom_dir = Path(folder_paths.base_path) / "custom_nodes"
         if not custom_dir.is_dir():
             return {}
         candidates = sorted(
             p for p in custom_dir.iterdir()
             if p.is_dir() and not p.name.startswith(".") and not p.name.startswith("__")
+            and (used_dirs is None or p.name in used_dirs)
         )
 
         # Pin our own origin to the canonical public URL. The local remote
@@ -556,11 +610,13 @@ class RunflowDeploy:
         # manifest must always list that one.
         self_dir = Path(__file__).resolve().parent
 
-        def _entry(path: Path) -> tuple[str, dict]:
+        def _entry(path: Path) -> tuple[str, dict] | None:
             info = read_git(path)
             origin = info.origin
             if path.resolve() == self_dir or path.name == "ComfyUI-Runflow":
                 origin = "https://github.com/runflow-io/ComfyUI-Runflow"
+            if not origin:
+                return None
             return path.name, {
                 "origin": origin,
                 "commit": info.commit,
@@ -570,7 +626,8 @@ class RunflowDeploy:
         if not candidates:
             return {}
         with ThreadPoolExecutor(max_workers=8) as pool:
-            return dict(pool.map(_entry, candidates))
+            entries = pool.map(_entry, candidates)
+        return dict(entry for entry in entries if entry is not None)
 
     @staticmethod
     def get_comfyui_git_info():
