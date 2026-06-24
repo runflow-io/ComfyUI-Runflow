@@ -18,7 +18,12 @@ import aiohttp
 from aiohttp import web
 import folder_paths
 
-from .nodes import RunflowDeploy, resolve_hoisted_custom_nodes, resolve_workflow_models
+from .nodes import (
+    RunflowDeploy,
+    resolve_hoisted_custom_nodes,
+    resolve_workflow_models,
+    workflow_custom_node_dirs,
+)
 from .io_nodes import (
     NODE_CLASS_MAPPINGS as IO_NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS as IO_NODE_DISPLAY_NAME_MAPPINGS,
@@ -454,9 +459,18 @@ async def post_resolve_models(request):
     return web.json_response({"models": resolve_workflow_models(graph)})
 
 
-@PromptServer.instance.routes.get("/runflow/system-info")
+@PromptServer.instance.routes.post("/runflow/system-info")
 async def get_system_info(request):
-    installed_nodes = RunflowDeploy.get_custom_nodes()
+    # Body: ``{"graph": {...workflow graph...}}`` (optional). When a graph is
+    # supplied, the custom-node list is filtered to just the nodes the current
+    # workflow uses; without one we fall back to reporting every installed node.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    graph = (body or {}).get("graph") or {}
+    used_dirs = workflow_custom_node_dirs(graph) if graph else None
+    installed_nodes = RunflowDeploy.get_custom_nodes(used_dirs)
     # Augment with comfy-env-root.toml [node_reqs] dependencies so the deploy
     # manifest is self-contained even when a node's transitive deps haven't
     # been installed locally yet (Pozzetti 3D-pipeline family).
